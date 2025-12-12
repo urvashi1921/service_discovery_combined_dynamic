@@ -187,7 +187,8 @@
               X-Job-ID: "{{ tower_job_id | default('manual') }}"
               X-Batch-ID: "{{ batch_id | default('N/A') }}"
               X-Timestamp: "{{ '%Y-%m-%dT%H:%M:%S+05:30' | strftime(ansible_date_time.epoch | int + 19800) }}"
-            body: "{{ combined_payload }}"
+            body:
+              payload: "{{ combined_payload }}"
             status_code: "{{ final_webhook_expected_codes }}"
             timeout: "{{ final_webhook_timeout }}"
             validate_certs: "{{ final_webhook_validate_certs }}"
@@ -246,7 +247,8 @@
               X-Job-ID: "{{ tower_job_id | default('manual') }}"
               X-Batch-ID: "{{ batch_id | default('N/A') }}"
               X-Status: "FAILED"
-            body: "{{ failure_payload }}"
+            body:
+              payload: "{{ failure_payload }}"
             status_code: [200, 201, 202, 400, 404, 500]
             timeout: 30
             validate_certs: false
