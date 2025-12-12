@@ -5,7 +5,7 @@
 # ========================================
 
 - name: Run All Service Discovery Playbooks
-  hosts: all  # This will use ALL hosts from the AWX inventory
+  hosts: all
   gather_facts: yes
   become: yes
   
@@ -48,64 +48,80 @@
   gather_facts: yes
   become: no
   
-  vars:
-    # Default webhook configuration (can be overridden via extra_vars)
-    webhook_api_url: "{{ webhook_api_url | default('https://filecompression.acc.ltd/ServiceDiscovery/api/v1/servicediscovery/ansiblecall') }}"
-    webhook_timeout: 30
-    webhook_retries: 3
-    webhook_retry_delay: 5
-    webhook_expected_status_codes: [200, 201, 202]
-    webhook_validate_certs: false
-    discovery_job_name: "Service Discovery"
-    discovery_execution_node: "{{ ansible_hostname }}"
-    
+  # Load external variable files
+  vars_files:
+    - vars/webhook_config.yml
+    - vars/discovery_config.yml
+  
   tasks:
+    - name: Set webhook URL (allow override via extra_vars)
+      set_fact:
+        final_webhook_url: "{{ webhook_api_url | default(default_webhook_url) }}"
+        final_webhook_timeout: "{{ webhook_timeout }}"
+        final_webhook_retries: "{{ webhook_retries }}"
+        final_webhook_retry_delay: "{{ webhook_retry_delay }}"
+        final_webhook_expected_codes: "{{ webhook_expected_status_codes }}"
+        final_webhook_validate_certs: "{{ webhook_validate_certs }}"
+        final_discovery_job_name: "{{ discovery_job_name }}"
+        final_discovery_execution_node: "{{ ansible_hostname }}"
+    
+    - name: Display configuration
+      debug:
+        msg: |
+          ========================================
+          Configuration Loaded
+          ========================================
+          Webhook URL: {{ final_webhook_url }}
+          Timeout: {{ final_webhook_timeout }}s
+          Retries: {{ final_webhook_retries }}
+          Job Name: {{ final_discovery_job_name }}
+          ========================================
+    
     - name: Execute discovery collection and webhook delivery
       block:
         # Collect All Discovery Results
         - name: Collect Apache discoveries from all hosts
           set_fact:
-            apache_results: "{{ groups['all'] | map('extract', hostvars, 'apache_discovery_json') | select('defined') | list }}"
+            apache_results: "{{ groups['all'] | default([]) | map('extract', hostvars, 'apache_discovery_json') | select('defined') | list }}"
           
         - name: Collect Nginx discoveries from all hosts
           set_fact:
-            nginx_results: "{{ groups['all'] | map('extract', hostvars, 'nginx_discovery_json') | select('defined') | list }}"
+            nginx_results: "{{ groups['all'] | default([]) | map('extract', hostvars, 'nginx_discovery_json') | select('defined') | list }}"
           
         - name: Collect Tomcat discoveries from all hosts
           set_fact:
-            tomcat_results: "{{ groups['all'] | map('extract', hostvars, 'tomcat_discovery_json') | select('defined') | list }}"
+            tomcat_results: "{{ groups['all'] | default([]) | map('extract', hostvars, 'tomcat_discovery_json') | select('defined') | list }}"
           
         - name: Collect MySQL discoveries from all hosts
           set_fact:
-            mysql_results: "{{ groups['all'] | map('extract', hostvars, 'mysql_discovery_json') | select('defined') | list }}"
+            mysql_results: "{{ groups['all'] | default([]) | map('extract', hostvars, 'mysql_discovery_json') | select('defined') | list }}"
           
         - name: Collect PostgreSQL discoveries from all hosts
           set_fact:
-            postgres_results: "{{ groups['all'] | map('extract', hostvars, 'postgres_discovery_json') | select('defined') | list }}"
+            postgres_results: "{{ groups['all'] | default([]) | map('extract', hostvars, 'postgres_discovery_json') | select('defined') | list }}"
           
         - name: Collect MongoDB discoveries from all hosts
           set_fact:
-            mongodb_results: "{{ groups['all'] | map('extract', hostvars, 'mongodb_discovery_json') | select('defined') | list }}"
+            mongodb_results: "{{ groups['all'] | default([]) | map('extract', hostvars, 'mongodb_discovery_json') | select('defined') | list }}"
 
         - name: Calculate total instances
           set_fact:
-            total_apache: "{{ apache_results | map(attribute='discovery') | flatten | length }}"
-            total_nginx: "{{ nginx_results | map(attribute='discovery') | flatten | length }}"
-            total_tomcat: "{{ tomcat_results | map(attribute='discovery') | flatten | length }}"
-            total_mysql: "{{ mysql_results | map(attribute='discovery') | flatten | length }}"
-            total_postgres: "{{ postgres_results | map(attribute='discovery') | flatten | length }}"
-            total_mongodb: "{{ mongodb_results | map(attribute='discovery') | flatten | length }}"
+            total_apache: "{{ apache_results | map(attribute='discovery', default=[]) | flatten | length }}"
+            total_nginx: "{{ nginx_results | map(attribute='discovery', default=[]) | flatten | length }}"
+            total_tomcat: "{{ tomcat_results | map(attribute='discovery', default=[]) | flatten | length }}"
+            total_mysql: "{{ mysql_results | map(attribute='discovery', default=[]) | flatten | length }}"
+            total_postgres: "{{ postgres_results | map(attribute='discovery', default=[]) | flatten | length }}"
+            total_mongodb: "{{ mongodb_results | map(attribute='discovery', default=[]) | flatten | length }}"
 
         - name: Build combined results payload
           set_fact:
             combined_payload:
               job_info:
-                job_id: "{{ tower_job_id | default(batch_id) | default(ansible_date_time.epoch) }}"
-                job_name: "{{ tower_job_template_name | default(discovery_job_name) }}"
+                job_id: "{{ tower_job_id | default(ansible_date_time.epoch) }}"
                 batch_id: "{{ batch_id | default('N/A') }}"
-                requested_by: "{{ requested_by | default('Manual') }}"
+                job_name: "{{ tower_job_template_name | default(final_discovery_job_name) }}"
                 execution_time: "{{ ansible_date_time.iso8601 }}"
-                execution_node: "{{ discovery_execution_node }}"
+                execution_node: "{{ final_discovery_execution_node }}"
                 status: "success"
               discovery_results:
                 middleware:
@@ -137,7 +153,7 @@
               summary:
                 total_middleware_instances: "{{ total_apache | int + total_nginx | int + total_tomcat | int }}"
                 total_database_instances: "{{ total_mysql | int + total_postgres | int + total_mongodb | int }}"
-                total_servers_scanned: "{{ groups['all'] | length }}"
+                total_servers_scanned: "{{ groups['all'] | default([]) | length }}"
                 discovery_breakdown:
                   - service: "Apache"
                     instances: "{{ total_apache }}"
@@ -152,36 +168,38 @@
                   - service: "MongoDB"
                     instances: "{{ total_mongodb }}"
 
-        - name: Display combined payload
+        - name: Display combined payload summary
           debug:  
             msg: |
               ========================================
-              Combined Discovery Payload  
+              Combined Discovery Payload Summary
               ========================================
-              Total Servers: {{ groups['all'] | length }}
+              Batch ID: {{ batch_id | default('N/A') }}
+              Total Servers: {{ groups['all'] | default([]) | length }}
               Total Middleware: {{ total_apache | int + total_nginx | int + total_tomcat | int }}
               Total Database: {{ total_mysql | int + total_postgres | int + total_mongodb | int }}
+              Webhook URL: {{ final_webhook_url }}
               ========================================
          
         - name: Send combined results to webhook API
           uri:
-            url: "{{ webhook_api_url }}"
+            url: "{{ final_webhook_url }}"
             method: POST
             body_format: json
             headers:
               Content-Type: "application/json"
-              X-Job-ID: "{{ tower_job_id | default(batch_id) | default('manual') }}"
+              X-Job-ID: "{{ tower_job_id | default('manual') }}"
               X-Batch-ID: "{{ batch_id | default('N/A') }}"
               X-Timestamp: "{{ ansible_date_time.iso8601 }}"
             body: "{{ combined_payload }}"
-            status_code: "{{ webhook_expected_status_codes }}"
-            timeout: "{{ webhook_timeout }}"
-            validate_certs: "{{ webhook_validate_certs }}"
+            status_code: "{{ final_webhook_expected_codes }}"
+            timeout: "{{ final_webhook_timeout }}"
+            validate_certs: "{{ final_webhook_validate_certs }}"
             return_content: yes
           register: webhook_response
-          until: webhook_response.status in webhook_expected_status_codes
-          retries: "{{ webhook_retries }}"
-          delay: "{{ webhook_retry_delay }}"
+          until: webhook_response.status in final_webhook_expected_codes
+          retries: "{{ final_webhook_retries }}"
+          delay: "{{ final_webhook_retry_delay }}"
           
         - name: Display webhook response
           debug:
@@ -199,11 +217,12 @@
               ========================================
               Service Discovery Completed Successfully
               ========================================
-              Total Servers: {{ groups['all'] | length }}
+              Batch ID: {{ batch_id | default('N/A') }}
+              Total Servers: {{ groups['all'] | default([]) | length }}
               Total Middleware: {{ total_apache | int + total_nginx | int + total_tomcat | int }}
               Total Database: {{ total_mysql | int + total_postgres | int + total_mongodb | int }}
               
-              Results sent to: {{ webhook_api_url }}
+              Results sent to: {{ final_webhook_url }}
               Webhook Status: {{ webhook_response.status }}
               ========================================
 
@@ -212,34 +231,34 @@
           set_fact:
             failure_payload:
               job_info:
-                job_id: "{{ tower_job_id | default(batch_id) | default(ansible_date_time.epoch) }}"
-                job_name: "{{ tower_job_template_name | default(discovery_job_name) }}"
+                job_id: "{{ tower_job_id | default(ansible_date_time.epoch) }}"
                 batch_id: "{{ batch_id | default('N/A') }}"
-                requested_by: "{{ requested_by | default('Manual') }}"
+                job_name: "{{ tower_job_template_name | default(final_discovery_job_name) }}"
                 execution_time: "{{ ansible_date_time.iso8601 }}"
                 status: "failed"
               error:
                 message: "Service discovery failed"
                 task: "{{ ansible_failed_task.name | default('Unknown') }}"
-                error_details: "{{ ansible_failed_result | default({}) }}"
+                error_details: "{{ ansible_failed_result.msg | default('Unknown error') }}"
 
         - name: Send failure notification to webhook
           uri:
-            url: "{{ webhook_api_url }}"
+            url: "{{ final_webhook_url }}"
             method: POST
             body_format: json
             headers:
               Content-Type: "application/json"
-              X-Job-ID: "{{ tower_job_id | default(batch_id) | default('manual') }}"
+              X-Job-ID: "{{ tower_job_id | default('manual') }}"
+              X-Batch-ID: "{{ batch_id | default('N/A') }}"
               X-Status: "FAILED"
             body: "{{ failure_payload }}"
-            status_code: "{{ webhook_expected_status_codes }}"
+            status_code: [200, 201, 202, 400, 404, 500]
             timeout: 30
-            validate_certs: "{{ webhook_validate_certs }}"
+            validate_certs: false
           failed_when: false
           ignore_errors: yes
 
-        - name: Display failure message (but DO NOT FAIL)
+        - name: Display failure message
           debug:
             msg: |
               ========================================

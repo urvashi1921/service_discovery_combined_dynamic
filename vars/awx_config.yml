@@ -1,0 +1,16 @@
+---
+# ========================================
+# AWX/Tower Configuration
+# ========================================
+
+# Default organization
+awx_organization: "Default"
+
+# Inventory settings
+awx_inventory_prefix: "temp_inventory_"
+awx_inventory_cleanup_enabled: true
+awx_inventory_cleanup_delay: 3600  # 1 hour
+
+# Job execution settings
+awx_job_timeout: 3600
+awx_concurrent_jobs: 5

@@ -1,0 +1,26 @@
+---
+# ========================================
+# Webhook Configuration
+# ========================================
+
+# Webhook API URL
+default_webhook_url: "https://filecompression.acc.ltd/ServiceDiscovery/api/v1/servicediscovery/ansiblecall"
+
+# Webhook timeout and retry settings
+webhook_timeout: 30
+webhook_retries: 3
+webhook_retry_delay: 5
+
+# Expected HTTP status codes for success
+webhook_expected_status_codes:
+  - 200
+  - 201
+  - 202
+
+# SSL/TLS certificate validation
+webhook_validate_certs: false
+
+# Webhook headers (optional)
+webhook_custom_headers:
+  X-API-Version: "v1"
+  X-Source: "AWX-Ansible"
