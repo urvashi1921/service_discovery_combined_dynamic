@@ -207,7 +207,7 @@
               ========================================
               Webhook API Response
               ========================================
-              Status: {{ webhook_response.status }}
+              Status: {{ webhook_response.status | default('SKIPPED') }}
               Response: {{ webhook_response.json | default(webhook_response.content) | default('No response') }}
               ========================================
 
@@ -221,7 +221,6 @@
               Total Servers: {{ groups['all'] | default([]) | length }}
               Total Middleware: {{ total_apache | int + total_nginx | int + total_tomcat | int }}
               Total Database: {{ total_mysql | int + total_postgres | int + total_mongodb | int }}
-              
               Results sent to: {{ final_webhook_url }}
               Webhook Status: {{ webhook_response.status }}
               ========================================
@@ -256,7 +255,6 @@
             timeout: 30
             validate_certs: false
           failed_when: false
-          ignore_errors: yes
 
         - name: Display failure message
           debug:
