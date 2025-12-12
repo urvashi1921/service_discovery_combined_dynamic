@@ -56,7 +56,8 @@
   tasks:
     - name: Set webhook URL (allow override via extra_vars)
       set_fact:
-        final_webhook_url: "{{ webhook_api_url | default(default_webhook_url) }}"
+        #final_webhook_url: "{{ webhook_api_url | default(default_webhook_url) }}"
+        final_webhook_url: "{{ default_webhook_url }}"
         final_webhook_timeout: "{{ webhook_timeout }}"
         final_webhook_retries: "{{ webhook_retries }}"
         final_webhook_retry_delay: "{{ webhook_retry_delay }}"
