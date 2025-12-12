@@ -168,17 +168,12 @@
                   - service: "MongoDB"
                     instances: "{{ total_mongodb }}"
 
-        - name: Display combined payload summary
+        - name: Display combined payload
           debug:  
             msg: |
               ========================================
-              Combined Discovery Payload Summary
-              ========================================
-              Batch ID: {{ batch_id | default('N/A') }}
-              Total Servers: {{ groups['all'] | default([]) | length }}
-              Total Middleware: {{ total_apache | int + total_nginx | int + total_tomcat | int }}
-              Total Database: {{ total_mysql | int + total_postgres | int + total_mongodb | int }}
-              Webhook URL: {{ final_webhook_url }}
+              Combined Discovery Payload  
+              {{ combined_payload }}
               ========================================
          
         - name: Send combined results to webhook API
