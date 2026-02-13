@@ -1,0 +1,6 @@
+---
+# MongoDB default variables
+
+mongodb_default_dbpath: "/var/lib/mongo"
+mongodb_default_logpath: "/var/log/mongodb/mongod.log"
+mongodb_timezone_offset: 19800   # IST offset in seconds (+05:30)

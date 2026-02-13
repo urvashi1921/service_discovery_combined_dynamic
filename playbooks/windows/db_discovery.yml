@@ -1,0 +1,6 @@
+# playbooks/windows/db_discovery.yml
+
+- name: Run MSSQL Discovery
+  include_role:
+    name: windows/db/mssql
+  

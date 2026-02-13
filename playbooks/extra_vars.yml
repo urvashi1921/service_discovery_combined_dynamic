@@ -1,0 +1,8 @@
+client_id: "Axis-Bank-SurakshAI"
+client_secret: "5uu9KYY6Hzi84WeKH2g7Lt3wFzlyjemIEZdIeVUGeTRVwyTz6i"
+callback_url: "http://13.200.249.18:8080/servicediscovery-orchestrator/api/v1/callbacks/service-discovery-execution-callback"
+execution_id: "COMPLIANCE-RULE-EP-20260212-4AjhBhLAEt"
+callback_retries: 1
+callback_delay: 15
+callback_timeout: 60
+callback_expected_status_codes: [200,201,202,204]

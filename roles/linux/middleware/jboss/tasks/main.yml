@@ -1,0 +1,299 @@
+
+# ========================================
+# PREREQUISITE: Detect Available Tools
+# ========================================
+- name: Detect network tool
+  shell: |
+    if command -v ss >/dev/null 2>&1; then echo "ss"
+    elif command -v netstat >/dev/null 2>&1; then echo "netstat"
+    elif command -v lsof >/dev/null 2>&1; then echo "lsof"
+    else echo "none"; fi
+  register: network_tool
+  changed_when: false
+  failed_when: false
+
+# ========================================
+# STEP 1: GET ALL JBOSS PROCESS DATA IN ONE COMMAND
+# ========================================
+- name: Get all JBoss process data in single command
+  shell: |
+    ps -eo pid,cmd | grep -E 'jboss-modules\.jar|org\.jboss\.Main|org\.jboss\.as\.standalone|org\.jboss\.as\.host' | grep -v grep | \
+    awk '{
+      pid=$1
+      home=""
+      base=""
+      server=""
+      host=""
+      mode=""
+      for(i=2;i<=NF;i++) {
+        # JBoss EAP / WildFly
+        if($i ~ /-Djboss.home.dir=/) {
+          home=$i
+          gsub(/-Djboss.home.dir=/,"",home)
+        }
+        if($i ~ /-Djboss.server.base.dir=/) {
+          base=$i
+          gsub(/-Djboss.server.base.dir=/,"",base)
+        }
+        if($i ~ /-Djboss.server.name=/) {
+          server=$i
+          gsub(/-Djboss.server.name=/,"",server)
+        }
+        if($i ~ /-Djboss.host.name=/) {
+          host=$i
+          gsub(/-Djboss.host.name=/,"",host)
+        }
+        # Detect mode
+        if($i ~ /standalone/) mode="standalone"
+        if($i ~ /domain/) mode="domain"
+        if($i ~ /host-controller/) mode="host-controller"
+      }
+      # Defaults
+      if(base=="") {
+        if(mode=="standalone") base=home"/standalone"
+        else if(mode=="domain") base=home"/domain"
+        else base=home"/standalone"
+      }
+      if(server=="") server="default"
+      if(mode=="") mode="standalone"
+      if(host=="") host="N/A"
+      print pid":"home":"base":"server":"mode":"host
+    }' | sort -u
+  register: all_jboss_processes
+  changed_when: false
+  failed_when: false
+
+- name: Extract unique instances
+  set_fact:
+    jboss_unique_instances: "{{ all_jboss_processes.stdout_lines | map('regex_replace', '^[0-9]+:', '') | unique | list }}"
+
+- name: Debug - Show discovered processes and instances
+  debug:
+    msg:
+      - "Raw process data: {{ all_jboss_processes.stdout_lines }}"
+      - "Unique instances: {{ jboss_unique_instances }}"
+
+# ========================================
+# STEP 2: COLLECT ALL DATA FOR EACH INSTANCE
+# ========================================
+- name: Collect all data for each unique JBoss instance
+  shell: |
+    #!/bin/bash
+    IFS=':' read -r JBOSS_HOME JBOSS_BASE SERVER_NAME MODE HOST_NAME <<< "{{ item }}"
+
+    # Get PIDs for this specific instance from cached data
+    PIDS=$(echo '{{ all_jboss_processes.stdout_lines | join("\n") }}' | \
+            grep ":$JBOSS_HOME:$JBOSS_BASE:$SERVER_NAME:$MODE:$HOST_NAME$" | \
+            cut -d: -f1 | paste -sd, -)
+
+    # Debug output
+    echo "DEBUG: Processing instance $JBOSS_HOME:$JBOSS_BASE (Mode: $MODE)" >&2
+    echo "DEBUG: Found PIDs: $PIDS" >&2
+
+    # ---------- Version detection ----------
+    VERSION_FULL="unknown"
+    VERSION_NUM="unknown"
+
+    VERSION_SH="$JBOSS_HOME/bin/standalone.sh"
+    if [ -x "$VERSION_SH" ]; then
+      # Raw line (first line only)
+      VERSION_FULL=$(JBOSS_HOME="$JBOSS_HOME" "$VERSION_SH" --version 2>/dev/null | head -1)
+      # Extract strictly x.y.z (or x.y if patch absent)
+      VERSION_NUM=$(echo "$VERSION_FULL" | grep -oE '[0-9]+(\.[0-9]+){1,2}' | head -1)
+    fi
+
+    # Alternative: bin/product.conf (slot=7.4 or 7.4.23)
+    if [ -z "$VERSION_NUM" ] || [ "$VERSION_NUM" = "unknown" ]; then
+      if [ -f "$JBOSS_HOME/bin/product.conf" ]; then
+        SLOT=$(grep -E '^slot=' "$JBOSS_HOME/bin/product.conf" | head -1 | cut -d= -f2 | tr -d '"')
+        # Normalize slot to x.y.z
+        if echo "$SLOT" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+          VERSION_NUM="$SLOT"
+          [ "$VERSION_FULL" = "unknown" ] && VERSION_FULL="$SLOT"
+        elif echo "$SLOT" | grep -qE '^[0-9]+\.[0-9]+$'; then
+          VERSION_NUM="${SLOT}.0"
+          [ "$VERSION_FULL" = "unknown" ] && VERSION_FULL="$SLOT"
+        fi
+      fi
+    fi
+
+    # Alternative: version.txt (e.g., "JBoss EAP 7.4.23.GA ...")
+    if [ -z "$VERSION_NUM" ] || [ "$VERSION_NUM" = "unknown" ]; then
+      if [ -f "$JBOSS_HOME/version.txt" ]; then
+        VT_LINE=$(head -1 "$JBOSS_HOME/version.txt")
+        VT_NUM=$(echo "$VT_LINE" | grep -oE '[0-9]+(\.[0-9]+){1,2}' | head -1)
+        if [ -n "$VT_NUM" ]; then
+          VERSION_NUM="$VT_NUM"
+          [ "$VERSION_FULL" = "unknown" ] && VERSION_FULL="$VT_LINE"
+        fi
+      fi
+    fi
+
+    # Final fallback
+    [ -z "$VERSION_NUM" ] && VERSION_NUM="unknown"
+    [ -z "$VERSION_FULL" ] && VERSION_FULL="unknown"
+
+    # ---------- Config path ----------
+    CONFIG_PATH="not-found"
+    if [ "$MODE" = "standalone" ]; then
+      CONFIG_PATH="$JBOSS_BASE/configuration/standalone.xml"
+      if [ ! -f "$CONFIG_PATH" ]; then
+        CONFIG_PATH="$JBOSS_BASE/configuration/standalone-full.xml"
+      fi
+    elif [ "$MODE" = "domain" ] || [ "$MODE" = "host-controller" ]; then
+      CONFIG_PATH="$JBOSS_BASE/configuration/domain.xml"
+      HOST_CONFIG="$JBOSS_BASE/configuration/host.xml"
+      if [ -f "$HOST_CONFIG" ]; then
+        CONFIG_PATH="$CONFIG_PATH,$HOST_CONFIG"
+      fi
+    fi
+
+    # ---------- Bin dir ----------
+    BIN_DIR="$JBOSS_HOME/bin"
+
+    # ---------- Runtime listening ports ----------
+    PORTS=""
+    case "{{ network_tool.stdout }}" in
+      ss)
+        for pid in $(echo $PIDS | tr ',' ' '); do
+          PORTS="$PORTS $(ss -ltnp 2>/dev/null | grep "pid=$pid" | awk '{print $4}' | awk -F: '{print $NF}')"
+        done
+        ;;
+      netstat)
+        for pid in $(echo $PIDS | tr ',' ' '); do
+          PORTS="$PORTS $(netstat -tulnp 2>/dev/null | grep "$pid/" | awk '{print $4}' | awk -F: '{print $NF}')"
+        done
+        ;;
+      lsof)
+        for pid in $(echo $PIDS | tr ',' ' '); do
+          PORTS="$PORTS $(lsof -p $pid -i -P -n 2>/dev/null | awk '{print $9}' | awk -F: '{print $2}')"
+        done
+        ;;
+    esac
+    PORTS=$(echo $PORTS | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u | paste -sd, -)
+    [ -z "$PORTS" ] && PORTS="none"
+
+    # ---------- Configured ports from XML ----------
+    CONFIG_PORTS="none"
+    for cfg in $(echo $CONFIG_PATH | tr ',' ' '); do
+      if [ -f "$cfg" ]; then
+        TEMP_PORTS=$(grep -v '<!--' "$cfg" 2>/dev/null | \
+                    grep -oE '(port="|port-offset="|port offset=")[0-9]+' | \
+                    grep -oE '[0-9]+' | sort -u)
+        CONFIG_PORTS="$CONFIG_PORTS $TEMP_PORTS"
+      fi
+    done
+    CONFIG_PORTS=$(echo $CONFIG_PORTS | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u | paste -sd, -)
+    if [ -z "$CONFIG_PORTS" ] || [ "$CONFIG_PORTS" = "none" ]; then
+      CONFIG_PORTS="none"
+    fi
+
+    # ---------- JVM options ----------
+    JVM_OPTS=""
+    if [ -n "$PIDS" ]; then
+      FIRST_PID=$(echo $PIDS | cut -d, -f1)
+      JVM_OPTS=$(ps -p $FIRST_PID -o args= 2>/dev/null | grep -oE '(-Xm[sx][^ ]+|-XX:[^ ]+)' | head -5 | paste -sd'###' -)
+    fi
+
+    # ---------- Deployment dir ----------
+    if [ "$MODE" = "standalone" ]; then
+      DEPLOY_DIR="$JBOSS_BASE/deployments"
+    else
+      DEPLOY_DIR="$JBOSS_BASE/servers/$SERVER_NAME/deployments"
+    fi
+
+    # Output delimited format (include both version_full and version_num)
+    echo "JBOSS_HOME=$JBOSS_HOME|||JBOSS_BASE=$JBOSS_BASE|||SERVER_NAME=$SERVER_NAME|||MODE=$MODE|||HOST_NAME=$HOST_NAME|||PIDS=$PIDS|||VERSION_FULL=$VERSION_FULL|||VERSION_NUM=$VERSION_NUM|||CONFIG=$CONFIG_PATH|||BINDIR=$BIN_DIR|||PORTS=$PORTS|||CONFIG_PORTS=$CONFIG_PORTS|||JVMOPTS=$JVM_OPTS|||DEPLOY_DIR=$DEPLOY_DIR"
+  args:
+    executable: /bin/bash
+  register: jboss_data_collection
+  changed_when: false
+  failed_when: false
+  loop: "{{ jboss_unique_instances }}"
+  when: jboss_unique_instances | length > 0
+
+
+# ========================================
+# STEP 3: BUILD STANDARDIZED JSON OUTPUT
+# ========================================
+
+- name: Initialize discovery array
+  set_fact:
+    discovery_array: []
+
+- name: Parse and build standardized JBoss instances
+  set_fact:
+    discovery_array: "{{ discovery_array + [service_object] }}"
+  vars:
+    data_line: "{{ item.stdout }}"
+
+    jboss_home: "{{ data_line | regex_search('JBOSS_HOME=([^|]+)', '\\1') | first }}"
+    jboss_base: "{{ data_line | regex_search('JBOSS_BASE=([^|]+)', '\\1') | first }}"
+    server_name: "{{ data_line | regex_search('SERVER_NAME=([^|]+)', '\\1') | first }}"
+    mode: "{{ data_line | regex_search('MODE=([^|]+)', '\\1') | first }}"
+    host_name: "{{ data_line | regex_search('HOST_NAME=([^|]+)', '\\1') | first }}"
+    pids_raw: "{{ data_line | regex_search('PIDS=([^|]+)', '\\1') | first }}"
+    version_num: "{{ data_line | regex_search('VERSION_NUM=([^|]+)', '\\1') | first }}"
+    config_path_raw: "{{ data_line | regex_search('CONFIG=([^|]+)', '\\1') | first }}"
+    ports_raw: "{{ data_line | regex_search('PORTS=([^|]+)', '\\1') | first }}"
+    config_ports_raw: "{{ data_line | regex_search('CONFIG_PORTS=([^|]+)', '\\1') | first }}"
+    deploy_dir: "{{ data_line | regex_search('DEPLOY_DIR=([^|]+)', '\\1') | first }}"
+    jvm_opts_raw: "{{ data_line | regex_search('JVMOPTS=([^|]+)', '\\1') | first }}"
+
+    pids_array: "{{ pids_raw.split(',') | select('match','^[0-9]+$') | map('int') | list if pids_raw else [] }}"
+    ports_array: "{{ ports_raw.split(',') | select('match','^[0-9]+$') | map('int') | list if ports_raw and ports_raw != 'none' else [] }}"
+    config_ports_array: "{{ config_ports_raw.split(',') | select('match','^[0-9]+$') | map('int') | list if config_ports_raw and config_ports_raw != 'none' else [] }}"
+    config_paths_array: "{{ config_path_raw.split(',') if config_path_raw and config_path_raw != 'not-found' else [] }}"
+    jvm_opts_array: "{{ jvm_opts_raw.split('###') if jvm_opts_raw else [] }}"
+
+    # Determine correct binary script
+    binary_path: "{{ jboss_home }}/bin/{{ 'standalone.sh' if mode == 'standalone' else 'domain.sh' }}"
+
+    service_object:
+      service_type: "MIDDLEWARE"
+      service_name: "jboss"
+      service_version: "{{ version_num }}"
+
+      port: "{{ ports_array[0] if ports_array | length > 0 else None }}"
+      pid: "{{ pids_array[0] if pids_array | length > 0 else None }}"
+
+      paths:
+        binary_path: "{{ binary_path }}"
+        config_path: "{{ config_paths_array[0] if config_paths_array | length > 0 else None }}"
+        data_path: "{{ jboss_base }}"
+
+      additional_details: >-
+        {{
+          {
+            "mode": mode,
+            "server_name": server_name,
+            "host_name": host_name,
+            "config_ports": config_ports_array,
+            "all_ports": ports_array,
+            "all_pids": pids_array,
+            "deployment_path": deploy_dir,
+            "jboss_home": jboss_home,
+            "jvm_options": jvm_opts_array
+          }
+          if mode or config_ports_array | length > 0 or pids_array | length > 1
+          else None
+        }}
+
+      status: "{{ 'RUNNING' if pids_array | length > 0 else 'STOPPED' }}"
+
+  loop: "{{ jboss_data_collection.results }}"
+  when:
+    - jboss_unique_instances | length > 0
+    - jboss_data_collection is defined
+    - item.stdout is defined
+    - item.stdout != ''
+
+- name: Append Jboss services to discovered_services
+  set_fact:
+    discovered_services: "{{ discovered_services + (discovery_array | default([])) }}"
+
+- name: Display JSON output
+  debug:
+    msg: "JBoss Discovery: {{ discovery_array | length }} instance(s) found on {{ inventory_hostname }}"
+
+

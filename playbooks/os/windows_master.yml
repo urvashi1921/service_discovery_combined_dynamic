@@ -1,0 +1,102 @@
+# playbooks/os/windows_master.yml
+
+---
+#####################################################################
+# Windows Master Playbook
+# Responsible for:
+# - Building server_details
+# - Executing system discovery
+# - Executing DB discovery
+# - Executing middleware discovery
+#####################################################################
+
+#####################################################################
+# Ensure discovered_services list exists
+#####################################################################
+
+- name: Initialize discovered services list
+  set_fact:
+    discovered_services: "{{ discovered_services | default([]) }}"
+
+#####################################################################
+# Get Windows Boot Time & Uptime
+#####################################################################
+
+- name: Get Windows boot time
+  win_shell: |
+    (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+  register: win_boot_time
+
+- name: Get Windows uptime in seconds
+  win_shell: |
+    (Get-Date) - (Get-CimInstance Win32_OperatingSystem).LastBootUpTime | Select-Object -ExpandProperty TotalSeconds
+  register: win_uptime_seconds
+
+- name: Set uptime_seconds fact
+  set_fact:
+    uptime_seconds: "{{ win_uptime_seconds.stdout | float | int }}"
+#####################################################################
+# Format Uptime
+#####################################################################
+
+- name: Format uptime readable
+  set_fact:
+    uptime_readable: >-
+      {{
+        ((uptime_seconds | int) // 86400) ~ " days, " ~
+        "%02d:%02d:%02d" | format(
+          (((uptime_seconds | int) % 86400) // 3600),
+          (((uptime_seconds | int) % 3600) // 60),
+          ((uptime_seconds | int) % 60)
+        )
+      }}
+
+#####################################################################
+# Build Base Server Details
+#####################################################################
+
+- name: Set base server details
+  set_fact:
+    server_details:
+      os_name: "{{ ansible_distribution }}"
+      os_version: "{{ ansible_distribution_version }}"
+      architecture: "{{ ansible_architecture }}"
+      boot_time: "{{ win_boot_time.stdout }}"
+      uptime: "{{ uptime_readable }}"
+
+#####################################################################
+# Execute System Discovery (CPU, Memory, Disk)
+#####################################################################
+
+- name: Execute Windows System Discovery
+  block:
+    - include_tasks: ../windows/system_discovery.yml
+  rescue:
+    - set_fact:
+        final_status: "FAILED"
+        final_error_message: "System discovery failed: {{ ansible_failed_result.msg | default('Unknown error') }}"
+
+#####################################################################
+# Execute Database Discovery
+#####################################################################
+
+- name: Execute Windows DB Discovery
+  block:
+    - include_tasks: ../windows/db_discovery.yml
+  rescue:
+    - set_fact:
+        final_status: "FAILED"
+        final_error_message: "Database discovery failed: {{ ansible_failed_result.msg | default('Unknown error') }}"
+
+# #####################################################################
+# # Execute Middleware Discovery
+# #####################################################################
+
+# - name: Execute Windows Middleware Discovery
+#   block:
+#     - include_tasks: ../windows/middleware_discovery.yml
+#   rescue:
+#     - set_fact:
+#         final_status: "FAILED"
+#         final_error_message: "Middleware discovery failed: {{ ansible_failed_result.msg | default('Unknown error') }}"
+

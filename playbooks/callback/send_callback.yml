@@ -1,0 +1,103 @@
+---
+#####################################################################
+# Callback Validation & Execution (Production Ready)
+#####################################################################
+
+###############################################################
+# Validate Required Variables
+###############################################################
+
+- name: Validate required callback variables
+  assert:
+    that:
+      - client_id is defined
+      - client_secret is defined
+      - callback_url is defined
+      - execution_id is defined
+    fail_msg: >
+      Missing required callback variables.
+      Required: client_id, client_secret, callback_url, execution_id
+
+###############################################################
+# Build Final Callback URL
+###############################################################
+
+- name: Build callback endpoint
+  set_fact:
+    final_callback_url: "{{ callback_url }}/{{ execution_id }}"
+
+###############################################################
+# Default Retry Config (if not provided)
+###############################################################
+
+- name: Set default retry configuration
+  set_fact:
+    callback_retries: "{{ callback_retries | default(5) }}"
+    callback_delay: "{{ callback_delay | default(10) }}"
+    callback_timeout: "{{ callback_timeout | default(60) }}"
+    callback_expected_status_codes: "{{ callback_expected_status_codes | default([200,201,202]) }}"
+
+###############################################################
+# Send Callback with Retry
+###############################################################
+
+# - name: Send discovery result to callback API
+#   uri:
+#     url: "{{ final_callback_url }}"
+#     method: POST
+#     body_format: json
+#     headers:
+#       Content-Type: "application/json"
+#       x-client-id: "{{ client_id }}"
+#       x-client-secret: "{{ client_secret }}"
+#     body: "{{ response_payload }}"
+#     status_code: "{{ callback_expected_status_codes }}"
+#     timeout: "{{ callback_timeout }}"
+#     validate_certs: no
+#     return_content: yes
+#   register: callback_response
+# - name: Send discovery result to callback API
+#   uri:
+#     url: "{{ final_callback_url }}"
+#     method: POST
+#     body_format: json
+#     headers:
+#       Content-Type: "application/json"
+#       x-client-id: "{{ client_id }}"
+#       x-client-secret: "{{ client_secret }}"
+#     body: "{{ response_payload }}"
+#     status_code: "{{ callback_expected_status_codes }}"
+#     timeout: "{{ callback_timeout }}"
+#     validate_certs: no
+#     return_content: yes
+#   register: callback_response
+#   until: (callback_response.status_code | default(0)) in callback_expected_status_codes
+#   retries: "{{ callback_retries }}"
+#   delay: "{{ callback_delay }}"
+#   failed_when: false
+- name: Send discovery result to callback API with retry
+  uri:
+    url: "{{ final_callback_url }}"
+    method: POST
+    body_format: json
+    headers:
+      Content-Type: "application/json"
+      x-client-id: "{{ client_id }}"
+      x-client-secret: "{{ client_secret }}"
+    body: "{{ response_payload }}"
+    return_content: yes
+    timeout: "{{ callback_timeout | default(10) }}"
+    validate_certs: no
+  register: callback_response
+  retries: "{{ callback_retries | default(5) }}"
+  delay: "{{ callback_delay | default(5) }}"
+  until: callback_response is defined
+         and (callback_response.status | default(callback_response.status_code | default(0))) in callback_expected_status_codes
+  failed_when: false
+  delegate_to: localhost   # <--- Important: run from the Ansible controller
+
+- name: Print callback response safely
+  debug:
+    msg:
+      callback_status: "{{ callback_response.status | default(callback_response.status_code | default('unknown')) }}"
+      callback_response: "{{ callback_response.content | default(callback_response.json | default('No content')) }}"

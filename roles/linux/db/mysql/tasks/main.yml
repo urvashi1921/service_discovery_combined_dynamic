@@ -1,0 +1,288 @@
+
+
+# ========================================
+# PREREQUISITE: Detect Available Tools
+# ========================================
+- name: Detect network tool
+  shell: |
+    if command -v ss >/dev/null 2>&1; then echo "ss"
+    elif command -v netstat >/dev/null 2>&1; then echo "netstat"
+    elif command -v lsof >/dev/null 2>&1; then echo "lsof"
+    else echo "none"; fi
+  register: network_tool
+  changed_when: false
+  failed_when: false
+
+# ========================================
+# SINGLE PS COMMAND - EXTRACT EVERYTHING
+# ========================================
+- name: Extract all MySQL/MariaDB process details in one call
+  shell: |
+    ps aux | awk '$11 ~ /(mysqld|mariadbd)$/ && $11 !~ /grep/' | while read -r line; do
+      pid=$(echo "$line" | awk '{print $2}')
+      binary=$(echo "$line" | awk '{print $11}')
+      # Strict validation: binary must end with mysqld or mariadbd
+      if [[ ! "$binary" =~ (mysqld|mariadbd)$ ]]; then
+        continue
+      fi
+      # Verify the process is still running
+      if ! kill -0 "$pid" 2>/dev/null; then
+        continue
+      fi
+      # Verify binary exists and is executable
+      if [ ! -x "$binary" ] && [ ! -e "$binary" ]; then
+        continue
+      fi
+      # Double check via /proc/pid/cmdline
+      if [ -f "/proc/$pid/cmdline" ]; then
+        cmdline=$(cat "/proc/$pid/cmdline" | tr '\0' ' ')
+        if [[ ! "$cmdline" =~ (mysqld|mariadbd) ]]; then
+          continue
+        fi
+      else
+        continue
+      fi
+      full_args=$(echo "$line" | awk '{for(i=11;i<=NF;i++) printf "%s ", $i; print ""}')
+      basedir=$(echo "$full_args" | sed -n 's/.*--basedir=\([^ ]*\).*/\1/p' | head -1)
+      datadir=$(echo "$full_args" | sed -n 's/.*--datadir=\([^ ]*\).*/\1/p' | head -1)
+      defaults_file=$(echo "$full_args" | sed -n 's/.*--defaults-file=\([^ ]*\).*/\1/p' | head -1)
+      socket=$(echo "$full_args" | sed -n 's/.*--socket=\([^ ]*\).*/\1/p' | head -1)
+      port=$(echo "$full_args" | sed -n 's/.*--port=\([^ ]*\).*/\1/p' | head -1)
+      if [ -n "$binary" ] && [ -e "$binary" ]; then
+        binary=$(readlink -f "$binary" 2>/dev/null || echo "$binary")
+      fi
+      if [ -n "$datadir" ] && [ -d "$datadir" ]; then
+        instance_key="$datadir"
+      elif [ -n "$basedir" ] && [ -d "$basedir" ]; then
+        instance_key="$basedir"
+      elif [ -n "$defaults_file" ] && [ -f "$defaults_file" ]; then
+        instance_key="$defaults_file"
+      else
+        instance_key="$binary"
+      fi
+      cat <<EOF
+    {"pid":"${pid}","binary":"${binary:-not-found}","basedir":"${basedir:-}","datadir":"${datadir:-}","defaults_file":"${defaults_file:-}","socket":"${socket:-}","port":"${port:-}","instance_key":"${instance_key}"}
+    EOF
+    done
+  args:
+    executable: /bin/bash
+  register: mysql_processes_raw
+  changed_when: false
+  failed_when: false
+
+- name: Parse Output 
+  debug:
+    msg:
+      - "Output Parse: {{ mysql_processes_raw }}"
+      
+# ========================================
+# PARSE RAW OUTPUT INTO STRUCTURED DATA
+# ========================================
+- name: Parse MySQL processes into list
+  set_fact:
+    mysql_processes: "{{ mysql_processes_raw.stdout_lines | default([]) | map('from_json') | list }}"
+  when: mysql_processes_raw.stdout_lines | default([]) | length > 0
+
+- name: Set empty list if no processes found
+  set_fact:
+    mysql_processes: []
+  when: mysql_processes_raw.stdout_lines | default([]) | length == 0
+
+# ========================================
+# GROUP BY UNIQUE INSTANCE KEY
+# ========================================
+- name: Get unique instance keys
+  set_fact:
+    mysql_unique_instances: "{{ mysql_processes | map(attribute='instance_key') | unique | list }}"
+  when: mysql_processes | length > 0
+
+- name: Set empty instances if no processes
+  set_fact:
+    mysql_unique_instances: []
+  when: mysql_processes | length == 0
+
+# ========================================
+# CREATE DATA COLLECTION SCRIPT
+# ========================================
+- name: Create MySQL data collection script
+  copy:
+    dest: /tmp/mysql_collect_data.sh
+    mode: '0755'
+    content: |
+      #!/bin/bash
+      INSTANCE_KEY="$1"
+      NETWORK_TOOL="$2"
+      BINARY="$3"
+      PIDS_INPUT="$4"
+      BASEDIR="$5"
+      DATADIR="$6"
+      DEFAULTS_FILE="$7"
+      SOCKET_INPUT="$8"
+      # Strict validation: binary must end with mysqld or mariadbd
+      if [[ ! "$BINARY" =~ (mysqld|mariadbd)$ ]]; then
+        exit 0
+      fi
+      # Verify binary exists and is executable
+      if [ ! -x "$BINARY" ] && [ ! -e "$BINARY" ]; then
+        exit 0
+      fi
+      # Verify PIDs are still running and are actually MySQL/MariaDB
+      PIDS=""
+      for pid in $(echo "$PIDS_INPUT" | tr ',' ' '); do
+        if kill -0 "$pid" 2>/dev/null; then
+          # Double check via /proc/pid/cmdline
+          if [ -f "/proc/$pid/cmdline" ]; then
+            cmdline=$(cat "/proc/$pid/cmdline" | tr '\0' ' ')
+            if [[ "$cmdline" =~ (mysqld|mariadbd) ]]; then
+              PIDS="$PIDS,$pid"
+            fi
+          fi
+        fi
+      done
+      PIDS=$(echo "$PIDS" | sed 's/^,//')
+      if [ -z "$PIDS" ]; then
+        exit 0
+      fi
+      VERSION="unknown"
+      if [ -n "$BINARY" ] && [ -x "$BINARY" ] && [ "$BINARY" != "not-found" ]; then
+        VERSION=$($BINARY --version 2>/dev/null | head -n1 | sed -n 's/.*Ver \([0-9]\+\.[0-9]\+\.[0-9]\+\).*/\1/p' | head -1)
+      fi
+      if [ -z "$VERSION" ] || [ "$VERSION" = "unknown" ]; then
+        if command -v mysql >/dev/null 2>&1; then
+          VERSION=$(mysql --version 2>/dev/null | sed -n 's/.*Distrib \([0-9]\+\.[0-9]\+\.[0-9]\+\).*/\1/p' | head -1)
+        fi
+      fi
+      [ -z "$VERSION" ] && VERSION="unknown"
+      PORTS=""
+      case "$NETWORK_TOOL" in
+        ss)
+          for pid in $(echo $PIDS | tr ',' ' '); do
+            PORTS="$PORTS $(ss -ltnp 2>/dev/null | grep "pid=$pid" | awk '{print $4}' | awk -F: '{print $NF}')"
+          done
+          ;;
+        netstat)
+          for pid in $(echo $PIDS | tr ',' ' '); do
+            PORTS="$PORTS $(netstat -tulnp 2>/dev/null | grep "$pid/" | awk '{print $4}' | awk -F: '{print $NF}')"
+          done
+          ;;
+        lsof)
+          for pid in $(echo $PIDS | tr ',' ' '); do
+            PORTS="$PORTS $(lsof -p $pid -i -P -n 2>/dev/null | awk '{print $9}' | awk -F: '{print $2}')"
+          done
+          ;;
+      esac
+      PORTS=$(echo $PORTS | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u | paste -sd, -)
+      [ -z "$PORTS" ] && PORTS="none"
+      CONFIG_FILE="$DEFAULTS_FILE"
+      if [ -z "$CONFIG_FILE" ] || [ "$CONFIG_FILE" = "not-found" ]; then
+        for conf in "/etc/mysql/my.cnf" "/etc/my.cnf" "$BASEDIR/my.cnf" "$DATADIR/my.cnf" "/usr/etc/my.cnf" "~/.my.cnf"; do
+          if [ -f "$conf" ] && [ -r "$conf" ]; then
+            CONFIG_FILE="$conf"
+            break
+          fi
+        done
+      fi
+      [ -z "$CONFIG_FILE" ] && CONFIG_FILE="not-found"
+      SOCKET="$SOCKET_INPUT"
+      if [ -z "$SOCKET" ]; then
+        for sock in /var/lib/mysql/mysql.sock /tmp/mysql.sock /var/run/mysqld/mysqld.sock "$DATADIR/mysql.sock"; do
+          if [ -S "$sock" ]; then
+            SOCKET="$sock"
+            break
+          fi
+        done
+      fi
+      [ -z "$SOCKET" ] && SOCKET="/var/lib/mysql/mysql.sock"
+      echo "VERSION=$VERSION|||PORTS=$PORTS|||SOCKET=$SOCKET|||CONFIG=$CONFIG_FILE|||PIDS=$PIDS"
+  when: mysql_unique_instances | length > 0
+
+# ========================================
+# BUILD INSTANCE DATA FROM PARSED PROCESSES
+# ========================================
+- name: Collect additional data for each instance
+  shell: |
+    /tmp/mysql_collect_data.sh \
+      "{{ item }}" \
+      "{{ network_tool.stdout }}" \
+      "{{ (mysql_processes | selectattr('instance_key', 'equalto', item) | map(attribute='binary') | first) | default('not-found') }}" \
+      "{{ (mysql_processes | selectattr('instance_key', 'equalto', item) | map(attribute='pid') | join(',')) }}" \
+      "{{ (mysql_processes | selectattr('instance_key', 'equalto', item) | map(attribute='basedir') | select() | first) | default('/usr') }}" \
+      "{{ (mysql_processes | selectattr('instance_key', 'equalto', item) | map(attribute='datadir') | select() | first) | default(item) }}" \
+      "{{ (mysql_processes | selectattr('instance_key', 'equalto', item) | map(attribute='defaults_file') | select() | first) | default('') }}" \
+      "{{ (mysql_processes | selectattr('instance_key', 'equalto', item) | map(attribute='socket') | select() | first) | default('') }}"
+  register: mysql_additional_data
+  changed_when: false
+  failed_when: false
+  loop: "{{ mysql_unique_instances }}"
+  when: mysql_unique_instances | length > 0
+
+# ========================================
+# CLEANUP SCRIPT
+# ========================================
+- name: Remove temp script
+  file:
+    path: /tmp/mysql_collect_data.sh
+    state: absent
+  when: mysql_unique_instances | length > 0
+
+# ========================================
+# BUILD FINAL JSON STRUCTURE
+# ========================================
+- name: Initialize discovery array
+  set_fact:
+    discovery_array: []
+
+- name: Parse each MySQL instance
+  set_fact:
+    discovery_array: "{{ discovery_array + [json_instance] }}"
+  vars:
+    instance_key: "{{ item.item }}"
+    additional_data: "{{ item.stdout | default('') }}"
+    instance_processes: "{{ mysql_processes | selectattr('instance_key', 'equalto', instance_key) | list }}"
+
+    # Extract values from script output
+    version: "{{ (additional_data | regex_search('VERSION=([^|]+)', '\\1') | default(['unknown'], true)) | first }}"
+    ports_raw: "{{ (additional_data | regex_search('PORTS=([^|]+)', '\\1') | default([''], true)) | first }}"
+    socket_path: "{{ (additional_data | regex_search('SOCKET=([^|]+)', '\\1') | default([''], true)) | first }}"
+    config_path: "{{ (additional_data | regex_search('CONFIG=([^|]+)', '\\1') | default(['not-found'], true)) | first }}"
+    pids_raw: "{{ (additional_data | regex_search('PIDS=([^|]+)', '\\1') | default([''], true)) | first }}"
+
+    # Convert to arrays
+    pids_array: "{{ pids_raw.split(',') | select() | map('int') | list if pids_raw | length > 0 else [] }}"
+    ports_array: "{{ ports_raw.split(',') | select() | map('int') | list if ports_raw | length > 0 and ports_raw != 'none' else [] }}"
+
+    binary_path: "{{ (instance_processes | map(attribute='binary') | select() | first) | default('not-found') }}"
+    datadir: "{{ (instance_processes | map(attribute='datadir') | select() | first) | default(instance_key) }}"
+    name: "{{ datadir | basename }}"
+
+    json_instance:
+      service_type: "DATABASE"
+      service_name: "mysql"
+      service_version: "{{ version }}"
+      port: "{{ ports_array[0] if ports_array | length > 0 else 0 }}"
+      pid: "{{ pids_array[0] if pids_array | length > 0 else 0 }}"
+
+      paths:
+        binary_path: "{{ binary_path }}"
+        config_path: "{{ config_path }}"
+        data_path: "{{ datadir }}"
+        socket_path: "{{ socket_path }}"
+
+      additional_details:
+        all_ports: "{{ ports_array }}"
+        all_pids: "{{ pids_array }}"
+
+      status: "{{ 'RUNNING' if pids_array | length > 0 else 'STOPPED' }}"
+  loop: "{{ mysql_additional_data.results | default([]) }}"
+  when:
+        - mysql_unique_instances is defined
+        - mysql_unique_instances | length > 0
+        - item.stdout is defined
+        - item.stdout | length > 0
+        - "'PIDS=' in item.stdout"
+        - (item.stdout | regex_search('PIDS=([^|]+)', '\\1') | default([''], true) | first | length) > 0
+  
+    
+- name: Append MySQL services to discovered_services
+  set_fact:
+    discovered_services: "{{ (discovered_services | default([])) + (discovery_array | default([])) }}"

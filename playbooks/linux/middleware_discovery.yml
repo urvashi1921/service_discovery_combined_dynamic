@@ -1,0 +1,21 @@
+---
+#####################################################################
+# Linux Middleware Discovery
+# Calls individual Middleware roles (Tomact,Nginx,Apache,jboss etc.)
+#####################################################################
+
+- name: Run Tomcat Discovery
+  include_role:
+    name: linux/middleware/tomcat
+
+- name: Run Nginx Discovery
+  include_role:
+    name: linux/middleware/nginx
+
+- name: Run Apache Discovery
+  include_role:
+    name: linux/middleware/apache
+
+- name: Run jboss Discovery
+  include_role:
+    name: linux/middleware/jboss

@@ -1,0 +1,42 @@
+# playbooks/os_router.yml
+
+
+
+---
+#####################################################################
+# OS Router - Decides which OS master playbook to execute
+#####################################################################
+
+
+- name: Print OS family and distribution
+  debug:
+    msg:
+      - "Host: {{ inventory_hostname }}"
+      - "OS Family: {{ ansible_os_family | default('NOT DETECTED') }}"
+      - "Distribution: {{ ansible_distribution | default('NOT DETECTED') }}"
+      - "Version: {{ ansible_distribution_version | default('NOT DETECTED') }}"
+
+
+
+- name: Validate OS family
+  fail:
+    msg: "Unsupported operating system: {{ ansible_os_family }} - {{ ansible_distribution }}"
+  when:
+    - ansible_os_family is not defined
+    - ansible_os_family not in ["RedHat", "Debian", "Suse", "Windows"]
+
+#####################################################################
+# Route to Linux Master
+#####################################################################
+
+- name: Include Linux Master Playbook
+  include_tasks: os/linux_master.yml
+  when: ansible_os_family in ["RedHat", "Debian", "Suse"]
+
+#####################################################################
+# Route to Windows Master
+#####################################################################
+
+- name: Include Windows Master Playbook
+  include_tasks: os/windows_master.yml
+  when: ansible_os_family == "Windows"

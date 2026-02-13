@@ -1,0 +1,18 @@
+---
+#####################################################################
+# Linux DB Discovery
+# Calls individual DB roles (MongoDB, MySQL, PostgreSQL, etc.)
+#####################################################################
+
+- name: Run MongoDB Discovery
+  include_role:
+    name: linux/db/mongodb
+  
+- name: Run postgres Discovery
+  include_role:
+    name: linux/db/postgres
+
+- name: Run MySQL Discovery
+  include_role:
+    name: linux/db/mysql
+  

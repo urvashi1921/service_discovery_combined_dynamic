@@ -1,0 +1,42 @@
+- name: Test Callback API
+  hosts: all
+  gather_facts: no
+  vars:
+    final_callback_url: "http://13.200.249.18:8080/servicediscovery-orchestrator/api/v1/callbacks/service-discovery-execution-callback/TEST-CALLBACK-002"
+    client_id: "Axis-Bank-SurakshAI"
+    client_secret: "5uu9KYY6Hzi84WeKH2g7Lt3wFzlyjemIEZdIeVUGeTRVwyTz6i"
+    callback_timeout: 10
+    callback_retries: 3
+    callback_delay: 5
+    callback_expected_status_codes: [200, 201]
+    response_payload:
+      status: "COMPLETED"
+      error_message: null
+
+  tasks:
+    - name: Send callback from controller
+      uri:
+        url: "{{ final_callback_url }}"
+        method: POST
+        body_format: json
+        headers:
+          Content-Type: "application/json"
+          x-client-id: "{{ client_id }}"
+          x-client-secret: "{{ client_secret }}"
+        body: "{{ response_payload }}"
+        return_content: yes
+        timeout: "{{ callback_timeout }}"
+        validate_certs: no
+      register: callback_response
+      retries: "{{ callback_retries }}"
+      delay: "{{ callback_delay }}"
+      until: callback_response is defined
+             and (callback_response.status | default(callback_response.status_code | default(0))) in callback_expected_status_codes
+      failed_when: false
+      delegate_to: localhost
+
+    - name: Print callback response
+      debug:
+        msg:
+          callback_status: "{{ callback_response.status | default(callback_response.status_code | default('unknown')) }}"
+          callback_response: "{{ callback_response.content | default(callback_response.json | default('No content')) }}"

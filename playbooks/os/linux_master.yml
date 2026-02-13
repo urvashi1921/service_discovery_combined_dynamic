@@ -1,0 +1,108 @@
+# playbooks/os/linux_master.yml
+---
+
+#####################################################################
+# Linux Master Playbook
+# Responsible for:
+# - Building server_details
+# - Executing system discovery
+# - Executing DB discovery
+# - Executing middleware discovery
+#####################################################################
+
+#####################################################################
+# Ensure discovered_services list exists
+#####################################################################
+
+- name: Initialize discovered services list
+  set_fact:
+    discovered_services: "{{ discovered_services | default([]) }}"
+
+#####################################################################
+# Calculate Boot Time (Accurate)
+#####################################################################
+
+- name: Get current epoch time
+  set_fact:
+    current_epoch: "{{ ansible_date_time.epoch | int }}"
+
+- name: Get uptime in seconds
+  set_fact:
+    uptime_seconds: "{{ ansible_uptime_seconds | int }}"
+
+- name: Calculate boot time epoch
+  set_fact:
+    boot_time_epoch: "{{ (current_epoch | int) - (uptime_seconds | int) }}"
+
+- name: Convert boot time to Asia/Kolkata ISO 8601
+  set_fact:
+    boot_time_iso: >-
+      {{
+        '%Y-%m-%dT%H:%M:%S+05:30'
+        | strftime((boot_time_epoch | int) + 19800)
+      }}
+
+#####################################################################
+# Convert Uptime to Human Readable Format
+#####################################################################
+
+- name: Format uptime readable
+  set_fact:
+    uptime_readable: >-
+      {{
+        ((uptime_seconds | int) // 86400) ~ " days, " ~
+        "%02d:%02d:%02d" | format(
+          (((uptime_seconds | int) % 86400) // 3600),
+          (((uptime_seconds | int) % 3600) // 60),
+          ((uptime_seconds | int) % 60)
+        )
+      }}
+
+#####################################################################
+# Build Base Server Details
+#####################################################################
+
+- name: Set base server details
+  set_fact:
+    server_details:
+      os_name: "{{ ansible_distribution }}"
+      os_version: "{{ ansible_distribution_version }}"
+      architecture: "{{ ansible_architecture }}"
+      boot_time: "{{ boot_time_iso }}"
+      uptime: "{{ uptime_readable }}"
+
+#####################################################################
+# Execute System Discovery (CPU, Memory, Disk)
+#####################################################################
+
+- name: Execute Linux System Discovery
+  block:
+    - include_tasks: ../linux/system_discovery.yml
+  rescue:
+    - set_fact:
+        final_status: "FAILED"
+        final_error_message: "System discovery failed: {{ ansible_failed_result.msg | default('Unknown error') }}"
+
+#####################################################################
+# Execute Database Discovery
+#####################################################################
+
+- name: Execute Linux DB Discovery
+  block:
+    - include_tasks: ../linux/db_discovery.yml
+  rescue:
+    - set_fact:
+        final_status: "FAILED"
+        final_error_message: "Database discovery failed: {{ ansible_failed_result.msg | default('Unknown error') }}"
+
+# #####################################################################
+# # Execute Middleware Discovery
+# #####################################################################
+
+- name: Execute Linux Middleware Discovery
+  block:
+    - include_tasks: ../linux/middleware_discovery.yml
+  rescue:
+    - set_fact:
+        final_status: "FAILED"
+        final_error_message: "Middleware discovery failed: {{ ansible_failed_result.msg | default('Unknown error') }}"

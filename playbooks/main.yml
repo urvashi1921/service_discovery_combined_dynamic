@@ -1,0 +1,72 @@
+# playbooks/main.yml
+
+---
+- name: Service Discovery - Main Entry
+  hosts: all
+  gather_facts: true
+  any_errors_fatal: false
+
+  vars:
+    final_status: "COMPLETED"
+    final_error_message: null
+    discovered_services: []
+
+  tasks:
+
+    #####################################################################
+    # Initialize Response Structure
+    #####################################################################
+
+    - name: Initialize response structure
+      set_fact:
+        response_payload:
+          status: "IN_PROGRESS"
+          error_message: null
+          server_details: {}
+          discovered_services: []
+
+    #####################################################################
+    # OS Routing Block (Critical Section)
+    #####################################################################
+
+    - name: Execute OS Specific Discovery
+      block:
+
+        - name: Include OS router
+          include_tasks: os_router.yml
+
+      rescue:
+
+        - name: Capture failure details
+          set_fact:
+            final_status: "FAILED"
+            final_error_message: "{{ ansible_failed_result.msg | default('Unknown error occurred during discovery') }}"
+
+      always:
+
+        #################################################################
+        # Build Final Server Details (Common Facts)
+        #################################################################
+
+        - name: Build server details structure
+          set_fact:
+            response_payload: >-
+              {{
+                {
+                  "status": final_status,
+                  "error_message": final_error_message,
+                  "server_details": server_details | default({}),
+                  "discovered_services": discovered_services | default([])
+                }
+              }}
+
+        #################################################################
+        # Print Final JSON Output
+        #################################################################
+        - name: Send result to callback orchestrator
+          include_tasks: callback/send_callback.yml
+          
+        - name: Print Final Discovery JSON
+          debug:
+            msg: "{{ response_payload }}"
+

@@ -1,0 +1,327 @@
+
+# ========================================
+# PREREQUISITE: Detect Available Network Tool
+# ========================================
+- name: Detect network tool
+  shell: |
+    if command -v ss >/dev/null 2>&1; then echo "ss"
+    elif command -v netstat >/dev/null 2>&1; then echo "netstat"
+    elif command -v lsof >/dev/null 2>&1; then echo "lsof"
+    else echo "none"; fi
+  register: network_tool
+  changed_when: false
+  failed_when: false
+
+# ========================================
+# STEP 1: GET APACHE PROCESS DATA
+# Produces lines: PID:BINARY:USER (e.g., 26278:/web/AxMwWeb/bin/httpd:root)
+# ========================================
+- name: Get Apache processes (pid:binary:user)
+  shell: |
+    ps aux | grep -E '[h]ttpd|[a]pache2' | awk '{print $2":"$11":"$1}' | sort -u
+  register: apache_process_data
+  changed_when: false
+  failed_when: false
+
+# ========================================
+# STEP 2: PARSE PROCESS DATA (SIMPLE & SAFE)
+# Extract the middle field (binary path) and uniquify.
+# ========================================
+- name: Parse process data (robust)
+  set_fact:
+    running_apache_processes: "{{ apache_process_data.stdout_lines | default([]) }}"
+    unique_binaries: "{{ (apache_process_data.stdout_lines | default([])) | map('regex_replace', '^[^:]*:([^:]+):.*', '\\1') | select('search', '^/') | unique | list }}"
+
+# ========================================
+# STEP 3: COLLECT DATA PER BINARY (robust ports/config ports)
+# ========================================
+- name: Collect Apache data per binary
+  shell: |
+    #!/bin/bash
+    # set -euo pipefail
+
+    BINARY="{{ item }}"
+
+    # PIDs that match this exact binary path from cached process data
+    PIDS=$(echo '{{ running_apache_processes | join("\n") }}' \
+      | awk -F: -v bin="$BINARY" '$2 == bin {print $1}' \
+      | paste -sd, -)
+
+    BIN_DIR=$(dirname "$BINARY")
+
+    # Prefer bin-local apachectl, else system apachectl/apache2ctl
+    APACHECTL="$BIN_DIR/apachectl"
+    if [ ! -x "$APACHECTL" ] && command -v apachectl >/dev/null 2>&1; then APACHECTL="$(command -v apachectl)"; fi
+    if [ ! -x "$APACHECTL" ] && command -v apache2ctl >/dev/null 2>&1; then APACHECTL="$(command -v apache2ctl)"; fi
+
+    # Version & -V output
+    VERSION="unknown"
+    CONFIG_OUTPUT=""
+    if [ -x "$APACHECTL" ]; then
+      VERSION=$("$APACHECTL" -v 2>/dev/null | awk -F/ '/Server version/ {print $2}' | awk '{print $1}')
+      CONFIG_OUTPUT=$("$APACHECTL" -V 2>/dev/null || true)
+    elif [ -x "$BINARY" ]; then
+      VERSION=$("$BINARY" -v 2>/dev/null | awk -F/ '/Server version/ {print $2}' | awk '{print $1}')
+      CONFIG_OUTPUT=$("$BINARY" -V 2>/dev/null || true)
+    fi
+    [ -z "${VERSION:-}" ] && VERSION="unknown"
+
+    # Config path and server root from -V
+    CONFIG_PATH=$(echo "$CONFIG_OUTPUT" | awk -F\" '/SERVER_CONFIG_FILE/ {print $2}')
+    SERVER_ROOT=$(echo "$CONFIG_OUTPUT" | awk -F\" '/HTTPD_ROOT/ {print $2}')
+
+    if [ -n "${CONFIG_PATH:-}" ] && [ "${CONFIG_PATH:0:1}" != "/" ]; then
+      CONFIG_PATH="${SERVER_ROOT:-/}/$CONFIG_PATH"
+    fi
+    [ -z "${CONFIG_PATH:-}" ] && CONFIG_PATH="unknown"
+    [ -z "${SERVER_ROOT:-}" ] && SERVER_ROOT="unknown"
+
+    # -----------------------------
+    # CONFIG_PORTS (INCLUDES-AWARE via apachectl dump, with fallbacks)
+    # -----------------------------
+    CONFIG_PORTS="none"
+    DUMP_RUN_CFG=""
+    if [ -x "$APACHECTL" ]; then
+      DUMP_RUN_CFG=$("$APACHECTL" -t -D DUMP_RUN_CFG 2>/dev/null || true)
+    elif [ -x "$BINARY" ]; then
+      DUMP_RUN_CFG=$("$BINARY" -t -D DUMP_RUN_CFG 2>/dev/null || true)
+    fi
+
+    # Preferred: parse Listen from DUMP_RUN_CFG (handles IPv6, wildcards, Includes)
+    CONFIG_PORTS=$(echo "$DUMP_RUN_CFG" | awk '
+      /[Ll]isten/ {
+        if (match($0, /\]:([0-9]+)([^0-9]|$)/, m))      print m[1];
+        else if (match($0, /:([0-9]+)([^0-9]|$)/, m))  print m[1];
+        else if (match($0, /[Ll]isten[[:space:]]+([0-9]+)/, m)) print m[1];
+      }' | sort -u | paste -sd, -)
+
+    # Fallback: apachectl -S (prints "port 80 namevhost ...")
+    if [ -z "${CONFIG_PORTS:-}" ] && [ -x "${APACHECTL:-}" ]; then
+      CONFIG_PORTS=$("$APACHECTL" -S 2>/dev/null | awk '/port[[:space:]][0-9]+[[:space:]]+namevhost/ {print $2}' | sort -u | paste -sd, -)
+    fi
+
+    # Last fallback: grep recursively under conf tree
+    if [ -z "${CONFIG_PORTS:-}" ] && [ -f "$CONFIG_PATH" ]; then
+      ROOT_DIR=$(dirname "$CONFIG_PATH")
+      CONFIG_PORTS=$(grep -RHI '^[[:space:]]*Listen[[:space:]]' "$ROOT_DIR" 2>/dev/null | \
+        awk -F: '{ $1=""; sub(/^:/,""); print }' | \
+        awk '
+          {
+            if (match($0, /\]:([0-9]+)([^0-9]|$)/, m))      { print m[1]; next }
+            if (match($0, /:([0-9]+)([^0-9]|$)/, m))        { print m[1]; next }
+            for (i=NF; i>=1; i--) if ($i ~ /^[0-9]+$/) { print $i; break }
+          }' | sort -u | paste -sd, -)
+    fi
+    [ -z "${CONFIG_PORTS:-}" ] && CONFIG_PORTS="none"
+
+    # -----------------------------
+    # RUNTIME PORTS (PID-aware; IPv6-safe)
+    # -----------------------------
+    PORTS="none"
+    if [ -n "${PIDS:-}" ] && [ "{{ network_tool.stdout }}" != "none" ]; then
+      case "{{ network_tool.stdout }}" in
+        ss)
+          PORTS=$(ss -H -ltnp 2>/dev/null | awk -v plist="$PIDS" '
+            BEGIN{ n=split(plist,a,","); for(i=1;i<=n;i++) pid[a[i]]=1 }
+            {
+              line=$0; found=0
+              while (match(line, /pid=([0-9]+)/, m)) {
+                if (pid[m[1]]) { found=1; break }
+                line=substr(line, RSTART+RLENGTH)
+              }
+              if (found) {
+                l=$4
+                if (match(l, /\]:([0-9]+)$/, mm)) print mm[1];
+                else if (match(l, /:([0-9]+)$/, mm)) print mm[1];
+              }
+            }' | sort -u | paste -sd, -)
+          ;;
+        netstat)
+          PORTS=$(netstat -tulnp 2>/dev/null | awk -v plist="$PIDS" '
+            BEGIN{ n=split(plist,a,","); for(i=1;i<=n;i++) pid[a[i]]=1 }
+            ($1 ~ /^(tcp|udp)/) {
+              split($7, b, "/");
+              if (pid[b[1]]) {
+                l=$4
+                if (match(l, /\]:([0-9]+)$/, mm)) print mm[1];
+                else if (match(l, /:([0-9]+)$/, mm)) print mm[1];
+              }
+            }' | sort -u | paste -sd, -)
+          ;;
+        lsof)
+          PORTS=$(lsof -nP -a -p $(echo "$PIDS" | tr ',' ' ') -iTCP -sTCP:LISTEN 2>/dev/null | \
+            awk 'NR>1 { if (match($9, /\]:([0-9]+)|:([0-9]+)$/, m)) print (m[1] ? m[1] : m[2]) }' | \
+            sort -u | paste -sd, -)
+          ;;
+      esac
+    fi
+    [ -z "${PORTS:-}" ] && PORTS="none"
+
+    # DocumentRoot (best effort from main config)
+    DOC_ROOT="unknown"
+    if [ -f "$CONFIG_PATH" ]; then
+      DOC_ROOT=$(grep -i '^[[:space:]]*DocumentRoot[[:space:]]' "$CONFIG_PATH" 2>/dev/null | head -1 | awk '{print $2}' | tr -d '"')
+      [ -z "$DOC_ROOT" ] && DOC_ROOT="unknown"
+    fi
+
+    # Run user (from a PID)
+    RUN_USER="unknown"
+    FIRST_PID=$(echo "${PIDS:-}" | cut -d, -f1)
+    if [ -n "$FIRST_PID" ]; then
+      RUN_USER=$(ps -p "$FIRST_PID" -o user= 2>/dev/null || true)
+      [ -z "$RUN_USER" ] && RUN_USER="unknown"
+    fi
+
+    echo "BINARY=$BINARY|||PIDS=${PIDS:-}|||VERSION=$VERSION|||CONFIG=$CONFIG_PATH|||SERVER_ROOT=$SERVER_ROOT|||PORTS=$PORTS|||CONFIG_PORTS=$CONFIG_PORTS|||DOC_ROOT=$DOC_ROOT|||RUN_USER=$RUN_USER"
+  args:
+    executable: /bin/bash
+  register: apache_data_collection
+  changed_when: false
+  failed_when: false
+  loop: "{{ unique_binaries }}"
+  when: unique_binaries | length > 0
+
+
+# ========================================
+# STEP 4: BUILD STANDARDIZED JSON OUTPUT
+# ========================================
+
+# - name: Initialize discovery array
+#   set_fact:
+#     discovery_array: []
+
+# - name: Build standardized Apache discovery JSON
+#   set_fact:
+#     discovery_array: "{{ discovery_array + [service_object] }}"
+#   vars:
+#     data_line: "{{ item.stdout }}"
+
+#     binary_path: "{{ data_line | regex_search('BINARY=([^|]+)', '\\1') | first }}"
+#     version: "{{ data_line | regex_search('VERSION=([^|]+)', '\\1') | first }}"
+#     config_path: "{{ data_line | regex_search('CONFIG=([^|]+)', '\\1') | first }}"
+#     server_root: "{{ data_line | regex_search('SERVER_ROOT=([^|]+)', '\\1') | first }}"
+#     ports_raw: "{{ data_line | regex_search('PORTS=([^|]+)', '\\1') | first }}"
+#     config_ports_raw: "{{ data_line | regex_search('CONFIG_PORTS=([^|]+)', '\\1') | first }}"
+#     pids_raw: "{{ data_line | regex_search('PIDS=([^|]+)', '\\1') | first }}"
+#     doc_root: "{{ data_line | regex_search('DOC_ROOT=([^|]+)', '\\1') | first }}"
+#     run_user: "{{ data_line | regex_search('RUN_USER=([^|]+)', '\\1') | first }}"
+
+#     pids_array: "{{ pids_raw.split(',') | select('match','^[0-9]+$') | map('int') | list if pids_raw else [] }}"
+#     ports_array: "{{ ports_raw.split(',') | select('match','^[0-9]+$') | map('int') | list if ports_raw and ports_raw != 'none' else [] }}"
+#     config_ports_array: "{{ config_ports_raw.split(',') | select('match','^[0-9]+$') | map('int') | list if config_ports_raw and config_ports_raw != 'none' else [] }}"
+
+#     service_object:
+#       service_type: "WEBSERVER"
+#       service_name: "apache"
+#       service_version: "{{ version }}"
+
+#       port: "{{ ports_array[0] if ports_array | length > 0 else None }}"
+#       pid: "{{ pids_array[0] if pids_array | length > 0 else None }}"
+
+#       paths:
+#         binary_path: "{{ binary_path }}"
+#         config_path: "{{ config_path if config_path != 'unknown' else None }}"
+#         data_path: "{{ doc_root if doc_root != 'unknown' else None }}"
+
+#       additional_details: >-
+#         {{
+#           {
+#             "config_ports": config_ports_array,
+#             "all_ports": ports_array,
+#             "all_pids": pids_array,
+#             "server_root": server_root,
+#             "run_user": run_user
+#           }
+#           if config_ports_array | length > 0
+#           or ports_array | length > 1
+#           or pids_array | length > 1
+#           else None
+#         }}
+
+#       status: "{{ 'RUNNING' if pids_array | length > 0 else 'STOPPED' }}"
+
+#   loop: "{{ apache_data_collection.results | default([]) }}"
+#   when:
+#     - apache_data_collection is defined
+#     - item.stdout is defined
+
+
+# ========================================
+# STEP 4: BUILD JSON OUTPUT (SAFE + NON-SKIPPING)
+# ========================================
+
+# ========================================
+# 1️⃣ Initialize Apache discovery array
+# ========================================
+- name: Initialize Apache discovery array
+  set_fact:
+    discovery_array: []
+
+# ========================================
+# 2️⃣ Parse and build standardized Apache instances
+# ========================================
+- name: Parse and build standardized Apache instances
+  set_fact:
+    discovery_array: "{{ discovery_array + [service_object] }}"
+  vars:
+    data_line: "{{ item.stdout }}"
+
+    binary_path_raw: "{{ data_line | regex_search('BINARY=([^|]+)', '\\1') | first }}"
+    version_raw: "{{ data_line | regex_search('VERSION=([^|]+)', '\\1') | first }}"
+    pids_raw: "{{ data_line | regex_search('PIDS=([^|]+)', '\\1') | first }}"
+    config_path_raw: "{{ data_line | regex_search('CONFIG=([^|]+)', '\\1') | first }}"
+    server_root_raw: "{{ data_line | regex_search('SERVER_ROOT=([^|]+)', '\\1') | first }}"
+    ports_raw: "{{ data_line | regex_search('PORTS=([^|]+)', '\\1') | first }}"
+    config_ports_raw: "{{ data_line | regex_search('CONFIG_PORTS=([^|]+)', '\\1') | first }}"
+    doc_root_raw: "{{ data_line | regex_search('DOC_ROOT=([^|]+)', '\\1') | first }}"
+    run_user_raw: "{{ data_line | regex_search('RUN_USER=([^|]+)', '\\1') | first }}"
+
+    pids_array: "{{ pids_raw.split(',') | select('match','^[0-9]+$') | map('int') | list if pids_raw else [] }}"
+    ports_array: "{{ ports_raw.split(',') | select('match','^[0-9]+$') | map('int') | list if ports_raw and ports_raw != 'none' else [] }}"
+    config_ports_array: "{{ config_ports_raw.split(',') | select('match','^[0-9]+$') | map('int') | list if config_ports_raw and config_ports_raw != 'none' else [] }}"
+
+    service_object:
+      service_type: "MIDDLEWARE"
+      service_name: "{{ binary_path_raw | basename }}"
+      service_version: "{{ version_raw | default('unknown') }}"
+
+      port: "{{ ports_array[0] if ports_array | length > 0 else None }}"
+      pid: "{{ pids_array[0] if pids_array | length > 0 else None }}"
+
+      paths:
+        binary_path: "{{ binary_path_raw }}"
+        config_path: "{{ config_path_raw }}"
+        data_path: "{{ doc_root_raw }}"
+
+      additional_details: >-
+        {{
+          {
+            "server_root": server_root_raw,
+            "run_user": run_user_raw,
+            "config_ports": config_ports_array,
+            "all_ports": ports_array,
+            "all_pids": pids_array
+          }
+          if config_ports_array | length > 0 or pids_array | length > 1
+          else None
+        }}
+
+      status: "{{ 'RUNNING' if pids_array | length > 0 else 'STOPPED' }}"
+
+  loop: "{{ apache_data_collection.results }}"
+  when:
+    - unique_binaries | length > 0
+    - apache_data_collection is defined
+    - item.stdout is defined
+    - item.stdout != ''
+
+# ========================================
+# 3️⃣ Append Apache services to discovered_services
+# ========================================
+- name: Append Apache services to discovered_services
+  set_fact:
+    discovered_services: "{{ discovered_services | default([]) + (discovery_array | default([])) }}"
+
+- name: Display Apache JSON output
+  debug:
+    msg: "Apache Discovery: {{ discovery_array | length }} instance(s) found on {{ inventory_hostname }}"

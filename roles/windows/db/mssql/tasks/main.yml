@@ -1,0 +1,566 @@
+# roles/windows/db/mssql - tasks
+- name: Get all MSSQL process data
+  win_shell: |
+    $procs = Get-WmiObject Win32_Process -Filter "Name='sqlservr.exe'" |
+              Select-Object ProcessId, CommandLine, ExecutablePath
+
+    $results = @()
+    foreach ($p in $procs) {
+      $pid     = $p.ProcessId
+      $cmdLine = $p.CommandLine
+      $exePath = $p.ExecutablePath
+
+      # Instance name resolve (default to MSSQLSERVER)
+      $instance = "MSSQLSERVER"
+      if ($cmdLine -match '-s\s*"?([^"\s]+)"?') { $instance = $matches[1] }
+      elseif ($cmdLine -match '-s([A-Za-z0-9_]+)') { $instance = $matches[1] }
+
+      # Optional: pick -d (master.mdf) and -e (ERRORLOG) from cmdline if present
+      $dParam = "UNKNOWN"
+      $eParam = "UNKNOWN"
+      if ($cmdLine -match '-d\s*"?([^"]+)"?') { $dParam = $matches[1] }
+      if ($cmdLine -match '-e\s*"?([^"]+)"?') { $eParam = $matches[1] }
+
+      $results += "$pid|$instance|$dParam|$eParam|$exePath"
+    }
+
+    if ($results.Count -eq 0) { "NO_PROCESSES_FOUND" }
+    else { $results }
+  register: all_mssql_processes
+  changed_when: false
+  failed_when: false
+
+- name: Parse process data and extract unique instances
+  set_fact:
+    mssql_unique_instances: "{{ all_mssql_processes.stdout_lines
+      | reject('match', '^NO_PROCESSES_FOUND$')
+      | map('regex_replace', '^[0-9]+\\|([^|]+)\\|.*', '\\1')
+      | unique | list }}"
+  when: all_mssql_processes.stdout_lines is defined
+
+- name: Debug - Show discovered processes and instances
+  debug:
+    msg:
+      - "Raw process data: {{ all_mssql_processes.stdout_lines }}"
+      - "Unique instances: {{ mssql_unique_instances }}"
+
+# ----------------------------------------
+# STEP 2: Stage robust collector and execute per instance
+# ----------------------------------------
+- name: Create temp work directory
+  win_tempfile:
+    state: directory
+    suffix: mssql_disc
+  register: mssql_tmpdir
+
+- name: Save discovered process lines to a file
+  win_copy:
+    dest: "{{ mssql_tmpdir.path }}\\process.txt"
+    content: >-
+      {{ (all_mssql_processes.stdout_lines | reject('match', '^NO_PROCESSES_FOUND$') | list) | join('\n') }}
+  when: all_mssql_processes.stdout_lines is defined
+
+- name: Stage MSSQL collector script
+  win_copy:
+    dest: "{{ mssql_tmpdir.path }}\\collect_instance.ps1"
+    content: |
+      param(
+        [Parameter(Mandatory = $true)][string]$InstanceName,
+        [Parameter(Mandatory = $true)][string]$ProcessFile
+      )
+
+      # Read process lines for this instance
+      $raw = ""
+      try { $raw = Get-Content -Raw -ErrorAction SilentlyContinue $ProcessFile -Encoding UTF8 } catch {}
+      $lines = @()
+      if ($raw) { $lines = $raw -split "`n" }
+
+      $instanceLines = $lines | Where-Object { $_ -match "\|$InstanceName\|" }
+      $pids = @()
+      $exePath = "not-found"
+      foreach ($line in $instanceLines) {
+        if ($line -match '^(\\d+)\\|') { $pids += $matches[1] }
+        if ($line -match '\\|([^|]+)$' -and $exePath -eq "not-found") { $exePath = $matches[1] }
+      }
+      $pidsString = if ($pids) { $pids -join "," } else { "none" }
+
+      # Resolve Instance ID from Instance Names\SQL (64/32-bit)
+      $regRoots = @(
+        "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Microsoft SQL Server"
+      )
+      $instanceId = $null
+      foreach ($root in $regRoots) {
+        try {
+          $mapPath = Join-Path $root "Instance Names\SQL"
+          $val = (Get-ItemProperty -Path $mapPath -ErrorAction SilentlyContinue).$InstanceName
+          if ($val) { $instanceId = $val; break }
+        } catch {}
+      }
+
+      # Build instance hives
+      $actualRegPath = "not-found"
+      $setupPath = $null
+      if ($instanceId) {
+        $p64 = "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$instanceId\MSSQLServer"
+        $p32 = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Microsoft SQL Server\$instanceId\MSSQLServer"
+        if (Test-Path $p64) { $actualRegPath = $p64 }
+        elseif (Test-Path $p32) { $actualRegPath = $p32 }
+        if ($actualRegPath -ne "not-found") { $setupPath = ($actualRegPath -replace '\\MSSQLServer$', '\Setup') }
+      }
+
+      # Version
+      $version = "unknown"
+      if (Test-Path $exePath) {
+        try { $version = "SQL-" + (Get-Item $exePath).VersionInfo.ProductVersion } catch {}
+      }
+      if ($version -eq "unknown" -and $setupPath) {
+        try {
+          $cv = (Get-ItemProperty -Path "$setupPath" -Name "PatchLevel" -ErrorAction SilentlyContinue)."PatchLevel"
+          if ($cv) { $version = "SQL-$cv" }
+        } catch {}
+      }
+
+      # Edition / ProductLevel / SharedDir
+      $edition = "unknown"
+      $productLevel = "unknown"
+      $sharedDir = "not-found"
+      try {
+        $edType = (Get-ItemProperty -Path "$actualRegPath\CurrentVersion" -Name "EditionType" -ErrorAction SilentlyContinue)."EditionType"
+        $edSetup = (Get-ItemProperty -Path "$setupPath" -Name "Edition" -ErrorAction SilentlyContinue)."Edition"
+        if ($edType) { $edition = $edType } elseif ($edSetup) { $edition = $edSetup }
+      } catch {}
+      try { $productLevel = (Get-ItemProperty -Path "$setupPath" -Name "PatchLevel" -ErrorAction SilentlyContinue)."PatchLevel" } catch {}
+      try {
+        $sharedDir = (Get-ItemProperty -Path "$setupPath" -Name "SharedCode" -ErrorAction SilentlyContinue)."SharedCode"
+        if (-not $sharedDir) { $sharedDir = (Get-ItemProperty -Path "$setupPath" -Name "SharedCodeDir" -ErrorAction SilentlyContinue)."SharedCodeDir" }
+        if (-not $sharedDir) { $sharedDir = "not-found" }
+      } catch {}
+
+      # Paths
+      $dataDir   = "not-found"
+      $logDir    = "not-found"
+      $backupDir = "not-found"
+      $baseDir   = "not-found"
+      $errorLogPath = "not-found"
+      $masterDataFile = "not-found"
+      $masterLogFile  = "not-found"
+
+      if ($actualRegPath -ne "not-found") {
+        try {
+          $dd = (Get-ItemProperty -Path "$actualRegPath" -Name "DefaultData" -ErrorAction SilentlyContinue)."DefaultData"
+          if ($dd -and (Test-Path $dd)) { $dataDir = $dd }
+          $dl = (Get-ItemProperty -Path "$actualRegPath" -Name "DefaultLog" -ErrorAction SilentlyContinue)."DefaultLog"
+          if ($dl -and (Test-Path $dl)) { $logDir = $dl }
+          $bk = (Get-ItemProperty -Path "$actualRegPath" -Name "BackupDirectory" -ErrorAction SilentlyContinue)."BackupDirectory"
+          if ($bk -and (Test-Path $bk)) { $backupDir = $bk }
+        } catch {}
+        try {
+          $sqlPath     = (Get-ItemProperty -Path "$setupPath" -Name "SQLPath" -ErrorAction SilentlyContinue)."SQLPath"
+          $sqlDataRoot = (Get-ItemProperty -Path "$setupPath" -Name "SQLDataRoot" -ErrorAction SilentlyContinue)."SQLDataRoot"
+          if ($sqlPath -and (Test-Path $sqlPath)) { $baseDir = $sqlPath }
+          elseif ($sqlDataRoot -and (Test-Path $sqlDataRoot)) { $baseDir = $sqlDataRoot }
+
+          if ($sqlDataRoot) {
+            $err = Join-Path $sqlDataRoot "Log\ERRORLOG"
+            if (Test-Path $err) { $errorLogPath = $err }
+            elseif (Test-Path (Join-Path $sqlDataRoot "Log")) { $errorLogPath = (Join-Path $sqlDataRoot "Log") }
+
+            $md = Join-Path $sqlDataRoot "DATA\master.mdf"
+            $ml = Join-Path $sqlDataRoot "DATA\mastlog.ldf"
+            if (Test-Path $md) { $masterDataFile = $md }
+            if (Test-Path $ml) { $masterLogFile  = $ml }
+          }
+        } catch {}
+      }
+
+      # Collation / Memory
+      $collation = "unknown"
+      $memoryLimitMB = "not-configured"
+      try {
+        $col = (Get-ItemProperty -Path "$setupPath" -Name "Collation" -ErrorAction SilentlyContinue)."Collation"
+        if ($col) { $collation = $col }
+      } catch {}
+      try {
+        $mem = (Get-ItemProperty -Path "$actualRegPath" -Name "max server memory (MB)" -ErrorAction SilentlyContinue)."max server memory (MB)"
+        if ($mem) { $memoryLimitMB = $mem }
+      } catch {}
+
+      # Network (from instance hive)
+      $tcpEnabled = "unknown"
+      $namedPipesEnabled = "unknown"
+      $configuredPort = "not-found"
+      if ($instanceId) {
+        $tcpReg  = "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$instanceId\MSSQLServer\SuperSocketNetLib\Tcp"
+        $tcpReg2 = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Microsoft SQL Server\$instanceId\MSSQLServer\SuperSocketNetLib\Tcp"
+        $tcpPath = if (Test-Path $tcpReg) { $tcpReg } elseif (Test-Path $tcpReg2) { $tcpReg2 } else { $null }
+
+        $npReg  = "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$instanceId\MSSQLServer\SuperSocketNetLib\Np"
+        $npReg2 = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Microsoft SQL Server\$instanceId\MSSQLServer\SuperSocketNetLib\Np"
+        $npPath = if (Test-Path $npReg) { $npReg } elseif (Test-Path $npReg2) { $npReg2 } else { $null }
+
+        try {
+          if ($tcpPath) {
+            $en = (Get-ItemProperty -Path $tcpPath -Name "Enabled" -ErrorAction SilentlyContinue)."Enabled"
+            if ($en -eq 1) {
+              $tcpEnabled = "true"
+              $ipAll = Join-Path $tcpPath "IPAll"
+              $port = (Get-ItemProperty -Path $ipAll -Name "TcpPort" -ErrorAction SilentlyContinue)."TcpPort"
+              if ($port) { $configuredPort = $port }
+              else {
+                $dyn = (Get-ItemProperty -Path $ipAll -Name "TcpDynamicPorts" -ErrorAction SilentlyContinue)."TcpDynamicPorts"
+                if ($dyn) { $configuredPort = "dynamic-$dyn" }
+              }
+            } else { $tcpEnabled = "false" }
+          }
+          if ($npPath) {
+            $npEn = (Get-ItemProperty -Path $npPath -Name "Enabled" -ErrorAction SilentlyContinue)."Enabled"
+            $namedPipesEnabled = if ($npEn -eq 1) { "true" } else { "false" }
+          }
+        } catch {}
+      }
+
+      # Runtime listening ports from PIDs (with netstat fallback)
+      $listeningPorts = @()
+
+      foreach ($pid in $pids) {
+        try {
+          $conns = Get-NetTCPConnection -OwningProcess $pid -State Listen -ErrorAction SilentlyContinue
+          foreach ($c in $conns) { if ($c.LocalPort) { $listeningPorts += $c.LocalPort } }
+        } catch {}
+      }
+
+      if (-not $listeningPorts -or $listeningPorts.Count -eq 0) {
+        try {
+          $ns = (netstat -ano | Select-String -Pattern "LISTENING")
+          foreach ($line in $ns) {
+            # IPv4 e.g.: TCP    0.0.0.0:1433   0.0.0.0:0   LISTENING   1234
+            if ($line -match '^\s*(TCP|UDP)\s+[^:]+:(\d+)\s+[^\s]+\s+LISTENING\s+(\d+)\s*$') {
+              $port = [int]$matches[2]
+              $linePid = $matches[3]
+              if ($pids -contains $linePid) { $listeningPorts += $port }
+            }
+            # IPv6 e.g.: TCP    [::]:1433      [::]:0      LISTENING   1234
+            elseif ($line -match '^\s*(TCP|UDP)\s+\[[^\]]+\]:(\d+)\s+[^\s]+\s+LISTENING\s+(\d+)\s*$') {
+              $port = [int]$matches[2]
+              $linePid = $matches[3]
+              if ($pids -contains $linePid) { $listeningPorts += $port }
+            }
+          }
+        } catch {}
+      }
+
+      $listeningPorts = $listeningPorts | Select-Object -Unique | Sort-Object
+      $portsString = if ($listeningPorts -and $listeningPorts.Count -gt 0) { $listeningPorts -join "," } else { "none" }
+
+      # Services + accounts + startup params + features
+      $serviceName = if ($InstanceName -eq "MSSQLSERVER") { "MSSQLSERVER" } else { "MSSQL`$$InstanceName" }
+      $agentServiceName = if ($InstanceName -eq "MSSQLSERVER") { "SQLSERVERAGENT" } else { "SQLAgent`$$InstanceName" }
+
+      $serviceStatus = "unknown"; $serviceStartMode = "unknown"; $serviceAccount = "unknown"; $startupParameters = "unknown"
+      try {
+        $svc = Get-WmiObject Win32_Service -Filter "Name='$serviceName'" -ErrorAction SilentlyContinue
+        if ($svc) {
+          $serviceStatus = $svc.State.ToString().ToLower()
+          $serviceStartMode = $svc.StartMode.ToString().ToLower()
+          $serviceAccount = $svc.StartName
+          $pn = $svc.PathName
+          if ($pn) {
+            $d = ($pn | Select-String -Pattern '-d\s*"?(?<v>[^"\s]+)"?' -AllMatches).Matches | ForEach-Object {$_.Groups['v'].Value} | Select-Object -First 1
+            $l = ($pn | Select-String -Pattern '-l\s*"?(?<v>[^"\s]+)"?' -AllMatches).Matches | ForEach-Object {$_.Groups['v'].Value} | Select-Object -First 1
+            $e = ($pn | Select-String -Pattern '-e\s*"?(?<v>[^"\s]+)"?' -AllMatches).Matches | ForEach-Object {$_.Groups['v'].Value} | Select-Object -First 1
+            $startupParameters = @("d=$d","l=$l","e=$e") -join ";"
+            if ($e -and (Test-Path $e)) { $errorLogPath = $e }
+            if ($d -and (Test-Path (Split-Path $d -Parent))) { $dataDir = Split-Path $d -Parent }
+            if ($l -and (Test-Path (Split-Path $l -Parent))) { $logDir = Split-Path $l -Parent }
+          }
+        }
+      } catch {}
+
+      $agentStatus = "unknown"; $agentStartMode = "unknown"; $agentAccount = "unknown"
+      try {
+        $as = Get-WmiObject Win32_Service -Filter "Name='$agentServiceName'" -ErrorAction SilentlyContinue
+        if ($as) {
+          $agentStatus = $as.State.ToString().ToLower()
+          $agentStartMode = $as.StartMode.ToString().ToLower()
+          $agentAccount = $as.StartName
+        }
+      } catch {}
+
+      $features = @()
+      try {
+        if (Get-Service -Name $agentServiceName -ErrorAction SilentlyContinue) { $features += "SQLAgent" }
+        $ftsName = if ($InstanceName -eq "MSSQLSERVER") { "MSSQLFDLauncher" } else { "MSSQLFDLauncher`$$InstanceName" }
+        if (Get-Service -Name $ftsName -ErrorAction SilentlyContinue) { $features += "FullTextSearch" }
+        if (Get-Service -Name "MsDtsServer*" -ErrorAction SilentlyContinue) { $features += "IntegrationServices" }
+        $asName = if ($InstanceName -eq "MSSQLSERVER") { "MSSQLServerOLAPService" } else { "MSOLAP`$$InstanceName" }
+        if (Get-Service -Name $asName -ErrorAction SilentlyContinue) { $features += "AnalysisServices" }
+        $rsName = if ($InstanceName -eq "MSSQLSERVER") { "ReportServer" } else { "ReportServer`$$InstanceName" }
+        if (Get-Service -Name $rsName -ErrorAction SilentlyContinue) { $features += "ReportingServices" }
+      } catch {}
+
+      # Cluster info (registry)
+      $isClusteredInstance = "false"; $clusterName = "not-clustered"
+      try {
+        $sqlCluster = (Get-ItemProperty -Path "$setupPath" -Name "SqlCluster" -ErrorAction SilentlyContinue)."SqlCluster"
+        if ($sqlCluster -eq 1) {
+          $isClusteredInstance = "true"
+          $vname = (Get-ItemProperty -Path "$setupPath" -Name "VirtualServerName" -ErrorAction SilentlyContinue)."VirtualServerName"
+          $clusterName = if ($vname) { $vname } else { "unknown-cluster" }
+        }
+      } catch {}
+
+      # Output (KEY=VALUE|||...) for parser
+      $output = "INSTANCE_NAME=$InstanceName|||"
+      $output += "INSTANCE_ID=$instanceId|||"
+      $output += "PIDS=$pidsString|||"
+      $output += "VERSION=$version|||"
+      $output += "PRODUCT_LEVEL=$productLevel|||"
+      $output += "EDITION=$edition|||"
+      $output += "BIN_PATH=$exePath|||"
+      $output += "BASE_DIR=$baseDir|||"
+      $output += "DATA_DIR=$dataDir|||"
+      $output += "LOG_DIR=$logDir|||"
+      $output += "BACKUP_DIR=$backupDir|||"
+      $output += "ERROR_LOG=$errorLogPath|||"
+      $output += "MASTER_DATA=$masterDataFile|||"
+      $output += "MASTER_LOG=$masterLogFile|||"
+      $output += "PORTS=$portsString|||"
+      $output += "CONFIG_PORT=$configuredPort|||"
+      $output += "TCP_ENABLED=$tcpEnabled|||"
+      $output += "NAMED_PIPES=$namedPipesEnabled|||"
+      $output += "COLLATION=$collation|||"
+      $output += "FEATURES=$($features -join ",")|||"
+      $output += "MEMORY=$memoryLimitMB|||"
+      $output += "SERVICE=$serviceName|||"
+      $output += "SERVICE_ACCOUNT=$serviceAccount|||"
+      $output += "STATUS=$serviceStatus|||"
+      $output += "START_MODE=$serviceStartMode|||"
+      $output += "AGENT_SERVICE=$agentServiceName|||"
+      $output += "AGENT_ACCOUNT=$agentAccount|||"
+      $output += "AGENT_STATUS=$agentStatus|||"
+      $output += "AGENT_START_MODE=$agentStartMode|||"
+      $output += "STARTUP_PARAMETERS=$startupParameters|||"
+      $output += "REGISTRY_PATH=$actualRegPath|||"
+      $output += "SHARED_DIR=$sharedDir|||"
+      $output += "IS_CLUSTERED=$isClusteredInstance|||"
+      $output += "CLUSTER_NAME=$clusterName"
+      Write-Output $output
+
+- name: Collect all data for each unique MSSQL instance (short cmdline)
+  win_shell: >
+    powershell -NoProfile -ExecutionPolicy Bypass
+    -File "{{ mssql_tmpdir.path }}\collect_instance.ps1"
+    -InstanceName "{{ item }}"
+    -ProcessFile "{{ mssql_tmpdir.path }}\process.txt"
+  register: mssql_data_collection
+  changed_when: false
+  failed_when: false
+  loop: "{{ mssql_unique_instances | default([]) }}"
+  when: mssql_unique_instances is defined and (mssql_unique_instances | length > 0)
+
+
+# ----------------------------------------
+# 1️⃣ Initialize discovery array
+# ----------------------------------------
+- name: Initialize MSSQL discovery array
+  set_fact:
+    discovery_array: []
+
+# ----------------------------------------
+# 2️⃣ Parse and build standardized MSSQL instances
+# ----------------------------------------
+- name: Parse and build standardized MSSQL instances
+  set_fact:
+    discovery_array: "{{ discovery_array + [service_object] }}"
+  vars:
+    data_line: "{{ item.stdout | trim }}"
+    kv_list: "{{ data_line | regex_findall('([A-Z_]+)=([^|]+)') }}"
+    pairs: "{{ dict(kv_list) }}"
+
+    # Extract fields
+    instance_name: "{{ pairs.INSTANCE_NAME | default('MSSQLSERVER') }}"
+    service_account: "{{ pairs.SERVICE_ACCOUNT | default('unknown') }}"
+    base_dir: "{{ pairs.BASE_DIR | default('not-found') }}"
+    data_dir: "{{ pairs.DATA_DIR | default('not-found') }}"
+    bin_path_raw: "{{ pairs.BIN_PATH | default('not-found') }}"
+    version_full: "{{ pairs.VERSION | default('unknown') }}"
+    pids_raw: "{{ pairs.PIDS | default('') }}"
+    ports_raw: "{{ pairs.PORTS | default('none') }}"
+
+    # Arrays
+    pids_array: >-
+      {{
+        pids_raw.split(',')
+        | select('match','^[0-9]+$')
+        | map('int')
+        | list
+        if pids_raw and pids_raw != 'none'
+        else []
+      }}
+
+    ports_array: >-
+      {{
+        ports_raw.split(',')
+        | select('match','^[0-9]+$')
+        | map('int')
+        | list
+        if ports_raw and ports_raw != 'none'
+        else []
+      }}
+
+    # Clean values
+    version_trim: "{{ version_full | regex_replace('^SQL-','') }}"
+    final_name: "{{ instance_name if instance_name != 'MSSQLSERVER' else 'MSSQL-Default' }}"
+    chosen_data_path: "{{ data_dir if data_dir != 'not-found' else base_dir }}"
+
+    # Final standardized object (aligned to JBoss style)
+    service_object:
+      service_type: "DATABASE"
+      service_name: "mssql"
+      service_version: "{{ version_trim }}"
+
+      port: "{{ ports_array[0] if ports_array | length > 0 else None }}"
+      pid: "{{ pids_array[0] if pids_array | length > 0 else None }}"
+
+      paths:
+        binary_path: "{{ bin_path_raw if bin_path_raw != 'not-found' else None }}"
+        config_path: null
+        data_path: "{{ chosen_data_path }}"
+
+      additional_details: >-
+        {{
+          {
+            "instance_name": final_name,
+            "run_user": service_account,
+            "all_ports": ports_array,
+            "all_pids": pids_array,
+            "base_dir": base_dir
+          }
+          if ports_array | length > 1 or pids_array | length > 1
+          else None
+        }}
+
+      status: "{{ 'RUNNING' if pids_array | length > 0 else 'STOPPED' }}"
+
+  loop: "{{ mssql_data_collection.results | default([]) }}"
+  when:
+    - item.stdout is defined
+    - item.stdout | trim != ''
+
+# ----------------------------------------
+# 3️⃣ Append MSSQL services to discovered_services
+# ----------------------------------------
+- name: Append MSSQL services to discovered_services
+  set_fact:
+    discovered_services: "{{ discovered_services + (discovery_array | default([])) }}"
+
+# ----------------------------------------
+# STEP 3: Build discovery array in the requested schema
+# ----------------------------------------
+# - name: Initialize discovery array
+#   set_fact:
+#     discovery_array: []
+
+# - name: Parse and build JSON formatted instances (schema-aligned)
+#   set_fact:
+#     discovery_array: "{{ discovery_array + [disco_item] }}"
+#   vars:
+#     data_line: "{{ (item.stdout | default('') | trim) }}"
+#     kv_list: "{{ data_line | regex_findall('([A-Z_]+)=([^|]+)') }}"
+#     pairs: "{{ dict(kv_list) }}"
+
+#     # Extracts
+#     instance_name: "{{ pairs.INSTANCE_NAME | default('MSSQLSERVER') }}"
+#     service_account: "{{ pairs.SERVICE_ACCOUNT | default('unknown') }}"
+#     registry_path: "{{ pairs.REGISTRY_PATH | default('not-found') }}"
+#     base_dir: "{{ pairs.BASE_DIR | default('not-found') }}"
+#     data_dir: "{{ pairs.DATA_DIR | default('not-found') }}"
+#     bin_path: "{{ pairs.BIN_PATH | default('not-found') }}"
+#     version_full: "{{ pairs.VERSION | default('unknown') }}"
+#     pids_raw: "{{ pairs.PIDS | default('') | trim }}"
+#     ports_raw: "{{ pairs.PORTS | default('none') | trim }}"
+#     config_port_raw: "{{ pairs.CONFIG_PORT | default('not-found') | trim }}"
+
+#     # Arrays
+#     pids_list: >-
+#       {{
+#         (pids_raw != '' and pids_raw != 'none')
+#         | ternary(pids_raw.split(',') | map('trim') | select('match','^\\d+$') | map('int') | list, [])
+#       }}
+#     ports_list: >-
+#       {{
+#         (ports_raw != '' and ports_raw != 'none')
+#         | ternary(ports_raw.split(',') | map('trim') | select('match','^\\d+$') | map('int') | list, [])
+#       }}
+#     config_port_list: >-
+#       {{
+#         (config_port_raw is match('^\\d+$'))
+#         | ternary([config_port_raw | int], [])
+#       }}
+
+#     # Name & version trimming (strip leading 'SQL-')
+#     name_val: "{{ (instance_name != 'MSSQLSERVER') | ternary(instance_name, 'MSSQL-Default') }}"
+#     version_trim: "{{ version_full | regex_replace('^SQL-','') }}"
+
+#     # Choose path to output (prefer data_dir else base_dir)
+#     chosen_path: "{{ (data_dir != 'not-found') | ternary(data_dir, base_dir) }}"
+
+#     # Compose schema fields
+#     disco_item:
+#       bin_path: "{{ (bin_path != 'not-found') | ternary([bin_path], []) }}"
+#       config_path: "{{ (registry_path != 'not-found') | ternary([registry_path], []) }}"
+#       config_ports: "{{ config_port_list }}"
+#       data_path:
+#         - "{{ chosen_path ~ '|||RUN_USER=' ~ service_account }}"
+#       name: "{{ name_val }}"
+#       pids: "{{ pids_list }}"
+#       ports: "{{ ports_list }}"
+#       run_user: "{{ service_account }}"
+#       server_root: "{{ base_dir }}"
+#       type: "DATABASE"
+#       version: "{{ version_trim }}"
+#   loop: "{{ mssql_data_collection.results | default([]) }}"
+#   when:
+#     - item.stdout is defined
+#     - (item.stdout | trim) != ''
+
+# # ----------------------------------------
+# # STEP 3.5: Force Asia/Kolkata (IST) timestamp
+# # ----------------------------------------
+# - name: Compute discovery timestamp (Asia/Kolkata / IST)
+#   set_fact:
+#     discovery_ts: "{{ '%Y-%m-%dT%H:%M:%S+05:30' | strftime(ansible_date_time.epoch | int) }}"
+
+# # ----------------------------------------
+# # STEP 4: Build final JSON object and display
+# # ----------------------------------------
+# - name: Build final JSON structure (MSSQL)
+#   set_fact:
+#     mssql_discovery_json:
+#       discovery: "{{ discovery_array | default([]) }}"
+#       discovery_timestamp: "{{ discovery_ts }}"
+#       hostname: "{{ inventory_hostname }}"
+#       ip_address: >-
+#         {{
+#           (
+#             (ansible_ip_addresses | default([])) +
+#             (ansible_all_ipv4_addresses | default([]))
+#           ) | first | default(ansible_default_ipv4.address | default('N/A'))
+#         }}
+#       os: "{{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+# - name: Display JSON output (count)
+#   debug:
+#     msg: "MSSQL Discovery: {{ discovery_array | length }} instance(s) found on {{ inventory_hostname }}"
+
+# - name: Show detailed discovery results (schema-aligned)
+#   debug:
+#     var: mssql_discovery_json
+#     verbosity: 0
+
+# - name: Cleanup temp files
+#   win_file:
+#     path: "{{ mssql_tmpdir.path }}"
+#     state: absent
+#   when: mssql_tmpdir is defined and mssql_tmpdir.path is defined

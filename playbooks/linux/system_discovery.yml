@@ -1,0 +1,93 @@
+# playbooks/linux/system_discovery.yml
+---
+#####################################################################
+# Linux System Discovery
+# Collects:
+# - CPU Details
+# - Memory Details
+# - Disk Details
+#####################################################################
+
+#####################################################################
+# CPU DETAILS
+#####################################################################
+
+- name: Build CPU details
+  set_fact:
+    cpu_info:
+      cpu_details:
+        model: "{{ ansible_processor[1] | default('Unknown') }}"
+        cores: "{{ ansible_processor_cores | default(0) }}"
+        threads: "{{ ansible_processor_vcpus | default(0) }}"
+        usage_percent: null   # Real-time usage needs custom command (optional)
+
+#####################################################################
+# MEMORY DETAILS
+#####################################################################
+
+- name: Convert memory values to GB
+  set_fact:
+    memory_info:
+      memory_details:
+        total_gb: "{{ ((ansible_memtotal_mb | int) / 1024) | round(2) }}"
+        used_gb: "{{ (((ansible_memtotal_mb | int) - (ansible_memfree_mb | int)) / 1024) | round(2) }}"
+        free_gb: "{{ ((ansible_memfree_mb | int) / 1024) | round(2) }}"
+        swap_total_gb: "{{ ((ansible_swaptotal_mb | int) / 1024) | round(2) }}"
+        swap_used_gb: "{{ (((ansible_swaptotal_mb | int) - (ansible_swapfree_mb | int)) / 1024) | round(2) }}"
+
+
+#####################################################################
+# DISK DETAILS - PARTITIONS
+#####################################################################
+
+- name: Initialize partition list
+  set_fact:
+    partition_list: []
+
+- name: Build partition details
+  set_fact:
+    partition_list: "{{ partition_list + [ {
+        'mount': item.mount,
+        'total_gb': ((item.size_total | int) / 1073741824) | round(2),
+        'used_gb': (((item.size_total | int) - (item.size_available | int)) / 1073741824) | round(2)
+      } ] }}"
+  loop: "{{ ansible_mounts | default([]) }}"
+  when: item.mount is defined
+
+
+#####################################################################
+# DISK TOTAL CALCULATION
+#####################################################################
+
+- name: Calculate total disk values
+  set_fact:
+    disk_total_bytes: "{{ (ansible_mounts | map(attribute='size_total') | sum(start=0)) | int }}"
+    disk_available_bytes: "{{ (ansible_mounts | map(attribute='size_available') | sum(start=0)) | int }}"
+
+- name: Calculate used disk bytes
+  set_fact:
+    disk_used_bytes: "{{ (disk_total_bytes | int) - (disk_available_bytes | int) }}"
+
+- name: Build disk details structure
+  set_fact:
+    disk_info:
+      disk_details:
+        total_gb: "{{ ((disk_total_bytes | int) / 1073741824) | round(2) }}"
+        used_gb: "{{ ((disk_used_bytes | int) / 1073741824) | round(2) }}"
+        free_gb: "{{ ((disk_available_bytes | int) / 1073741824) | round(2) }}"
+        partitions: "{{ partition_list }}"
+
+
+#####################################################################
+# Merge Everything into server_details
+#####################################################################
+
+- name: Merge system discovery into server_details
+  set_fact:
+    server_details: >-
+      {{
+        server_details
+        | combine(cpu_info, recursive=True)
+        | combine(memory_info, recursive=True)
+        | combine(disk_info, recursive=True)
+      }}

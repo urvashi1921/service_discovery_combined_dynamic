@@ -1,0 +1,140 @@
+# playbooks/windows/system_discovery.yml
+---
+#####################################################################
+# Windows System Discovery
+# Collects:
+# - CPU Details
+# - Memory Details
+# - Disk Details
+#####################################################################
+
+#####################################################################
+# CPU DETAILS
+#####################################################################
+
+- name: Get CPU details
+  win_shell: |
+    $cpu = Get-CimInstance Win32_Processor
+    [PSCustomObject]@{
+        Model = $cpu.Name
+        Cores = $cpu.NumberOfCores
+        Threads = $cpu.NumberOfLogicalProcessors
+    } | ConvertTo-Json -Compress
+  register: win_cpu
+
+- name: Set CPU details fact
+  set_fact:
+    cpu_info:
+      cpu_details:
+        model: "{{ (win_cpu.stdout | from_json).Model }}"
+        cores: "{{ (win_cpu.stdout | from_json).Cores }}"
+        threads: "{{ (win_cpu.stdout | from_json).Threads }}"
+        usage_percent: null
+
+#####################################################################
+# MEMORY DETAILS
+#####################################################################
+
+- name: Get Memory details
+  win_shell: |
+    $os = Get-CimInstance Win32_OperatingSystem
+    [PSCustomObject]@{
+        TotalGB = [math]::Round($os.TotalVisibleMemorySize / 1MB, 2)
+        FreeGB  = [math]::Round($os.FreePhysicalMemory / 1MB, 2)
+    } | ConvertTo-Json -Compress
+  register: win_memory
+
+- name: Set Memory details fact
+  set_fact:
+    memory_info:
+      memory_details:
+        total_gb: "{{ (win_memory.stdout | from_json).TotalGB }}"
+        free_gb: "{{ (win_memory.stdout | from_json).FreeGB }}"
+        used_gb: "{{ ((win_memory.stdout | from_json).TotalGB | float - (win_memory.stdout | from_json).FreeGB | float) | round(2) }}"
+        swap_total_gb: null
+        swap_used_gb: null
+
+#####################################################################
+# DISK DETAILS
+#####################################################################
+
+#####################################################################
+# DISK DETAILS (Stable Version)
+#####################################################################
+#####################################################################
+# DISK DETAILS (Stable Version)
+#####################################################################
+
+- name: Get Disk details
+  win_shell: |
+    $disks = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3"
+
+    $partitions = @()
+    $total = 0
+    $free  = 0
+    $used  = 0
+
+    foreach ($disk in $disks) {
+
+        $totalGB = [math]::Round($disk.Size / 1GB, 2)
+        $freeGB  = [math]::Round($disk.FreeSpace / 1GB, 2)
+        $usedGB  = [math]::Round(($disk.Size - $disk.FreeSpace) / 1GB, 2)
+
+        $total += $totalGB
+        $free  += $freeGB
+        $used  += $usedGB
+
+        $partitions += [PSCustomObject]@{
+            mount    = $disk.DeviceID
+            total_gb = $totalGB
+            used_gb  = $usedGB
+        }
+    }
+
+    [PSCustomObject]@{
+        total_gb  = [math]::Round($total,2)
+        free_gb   = [math]::Round($free,2)
+        used_gb   = [math]::Round($used,2)
+        partitions = $partitions
+    } | ConvertTo-Json -Depth 5 -Compress
+  register: win_disk_data
+
+- name: Set disk details fact
+  set_fact:
+    disk_info:
+      disk_details: "{{ win_disk_data.stdout | from_json }}"
+
+
+#####################################################################
+# Normalize Partition Format
+#####################################################################
+
+# - name: Normalize partition structure
+#   set_fact:
+#     disk_info:
+#       disk_details:
+#         total_gb: "{{ disk_info.disk_details.total_gb }}"
+#         used_gb: "{{ disk_info.disk_details.used_gb }}"
+#         free_gb: "{{ disk_info.disk_details.free_gb }}"
+#         partitions: >-
+#           {{
+#             partition_list | map('extract', {
+#               'mount': 'Mount',
+#               'total_gb': 'TotalGB',
+#               'used_gb': 'UsedGB'
+#             })
+#           }}
+
+#####################################################################
+# Merge Everything into server_details
+#####################################################################
+
+- name: Merge system discovery into server_details
+  set_fact:
+    server_details: >-
+      {{
+        server_details
+        | combine(cpu_info, recursive=True)
+        | combine(memory_info, recursive=True)
+        | combine(disk_info, recursive=True)
+      }}
