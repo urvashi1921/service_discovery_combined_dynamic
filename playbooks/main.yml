@@ -63,8 +63,8 @@
         #################################################################
         # Print Final JSON Output
         #################################################################
-        # - name: Send result to callback orchestrator
-        #   include_tasks: callback/send_callback.yml
+        - name: Send result to callback orchestrator
+          include_tasks: callback/send_callback.yml
           
         - name: Print Final Discovery JSON
           debug:
