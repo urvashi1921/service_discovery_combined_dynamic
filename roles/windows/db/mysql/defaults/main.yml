@@ -1,1 +1,29 @@
 # roles/windows/db/mysql - defaults
+---
+# Default MySQL paths for Windows
+mysql_default_paths:
+  - "C:\\Program Files\\MySQL\\MySQL Server *"
+  - "C:\\Program Files (x86)\\MySQL\\MySQL Server *"
+  - "C:\\MySQL"
+  - "{{ ansible_env['PROGRAMDATA'] | default('C:\\ProgramData') }}\\MySQL"
+
+# Default MySQL configuration file locations
+mysql_default_configs:
+  - "C:\\Program Files\\MySQL\\MySQL Server *\\my.ini"
+  - "C:\\Program Files (x86)\\MySQL\\MySQL Server *\\my.ini"
+  - "C:\\MySQL\\my.ini"
+  - "{{ ansible_env['WINDIR'] | default('C:\\Windows') }}\\my.ini"
+  - "{{ ansible_env['WINDIR'] | default('C:\\Windows') }}\\my.cnf"
+  - "{{ ansible_env['PROGRAMDATA'] | default('C:\\ProgramData') }}\\MySQL\\MySQL Server *\\my.ini"
+
+# Default MySQL data and log paths
+mysql_default_data_path: "{{ ansible_env['PROGRAMDATA'] | default('C:\\ProgramData') }}\\MySQL\\MySQL Server *\\data"
+mysql_default_log_path: "{{ ansible_env['PROGRAMDATA'] | default('C:\\ProgramData') }}\\MySQL\\MySQL Server *\\data\\*.err"
+
+# Default MySQL port
+mysql_default_port: 3306
+
+# MySQL Windows service name patterns
+mysql_service_names:
+  - "MySQL*"
+  - "MySQL*_*"

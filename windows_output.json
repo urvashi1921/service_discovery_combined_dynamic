@@ -1,0 +1,106 @@
+ {
+    "msg": {
+        "discovered_services": [
+            {
+                "additional_details": {
+                    "all_pids": [],
+                    "all_ports": [
+                        27017
+                    ],
+                    "auth_enabled": "",
+                    "replica_set": "",
+                    "service_name": "MongoDB"
+                },
+                "paths": {
+                    "binary_path": "C:\\MongoDB\\bin\\mongod.exe",
+                    "config_path": "C:\\MongoDB\\bin\\mongod.cfg",
+                    "data_path": "C:\\MongoDB\\data",
+                    "log_path": "C:\\MongoDB\\log\\mongod.log"
+                },
+                "pid": "0",
+                "port": "27017",
+                "service_name": "mongodb",
+                "service_type": "DATABASE",
+                "service_version": "8.0.19",
+                "status": "STOPPED"
+            },
+            {
+                "additional_details": {
+                    "all_pids": [],
+                    "all_ports": [
+                        3306
+                    ],
+                    "service_name": "MySQL80"
+                },
+                "paths": {
+                    "binary_path": "C:\\Program Files\\MySQL\\MySQL Server 8.0\\bin\\mysqld.exe",
+                    "config_path": "C:\\ProgramData\\MySQL\\MySQL Server 8.0\\my.ini",
+                    "data_path": "C:/ProgramData/MySQL/MySQL Server 8.0\\Data",
+                    "log_path": ""
+                },
+                "pid": "0",
+                "port": "3306",
+                "service_name": "mysql",
+                "service_type": "DATABASE",
+                "service_version": "8.0.44.0",
+                "status": "STOPPED"
+            },
+            {
+                "additional_details": {
+                    "all_pids": [],
+                    "all_ports": [
+                        5432
+                    ],
+                    "service_name": "postgresql-x64-17"
+                },
+                "paths": {
+                    "binary_path": "C:\\PostgreSQL\\bin\\postgres.exe",
+                    "config_path": "C:\\PostgreSQL\\data\\postgresql.conf",
+                    "data_path": "C:\\PostgreSQL\\data",
+                    "hba_path": "C:\\PostgreSQL\\data\\pg_hba.conf",
+                    "log_path": "C:\\PostgreSQL\\data\\log"
+                },
+                "pid": "0",
+                "port": "5432",
+                "service_name": "postgresql",
+                "service_type": "DATABASE",
+                "service_version": "17.8",
+                "status": "RUNNING"
+            }
+        ],
+        "error_message": null,
+        "server_details": {
+            "architecture": "64-bit",
+            "boot_time": "2026-02-17T10:25:10Z\r\n",
+            "cpu_details": {
+                "cores": "1",
+                "model": "Intel(R) Xeon(R) Platinum 8259CL CPU @ 2.50GHz",
+                "threads": "2",
+                "usage_percent": null
+            },
+            "disk_details": {
+                "free_gb": 48.2,
+                "partitions": [
+                    {
+                        "mount": "C:",
+                        "total_gb": 79.5,
+                        "used_gb": 31.3
+                    }
+                ],
+                "total_gb": 79.5,
+                "used_gb": 31.3
+            },
+            "memory_details": {
+                "free_gb": "0.52",
+                "swap_total_gb": null,
+                "swap_used_gb": null,
+                "total_gb": "3.83",
+                "used_gb": "3.31"
+            },
+            "os_name": "Microsoft Windows Server 2025 Datacenter",
+            "os_version": "10.0.26100.0",
+            "uptime": "0 days, 03:31:07"
+        },
+        "status": "COMPLETED"
+    }
+}

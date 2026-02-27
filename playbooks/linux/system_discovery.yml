@@ -1,3 +1,112 @@
+# # playbooks/linux/system_discovery.yml
+# ---
+# #####################################################################
+# # Linux System Discovery
+# # Collects:
+# # - CPU Details
+# # - Memory Details
+# # - Disk Details
+# #####################################################################
+
+# #####################################################################
+# # Initialize common variables
+# #####################################################################
+
+# - name: Initialize null value for JSON output
+#   set_fact:
+#     null_value: ~
+
+# #####################################################################
+# # CPU DETAILS
+# #####################################################################
+
+# - name: Build CPU details
+#   set_fact:
+#     cpu_info:
+#       cpu_details:
+#         model: "{{ ansible_processor[1] | default(ansible_processor[0] | default('Unknown')) }}"
+#         cores_physical: "{{ ansible_processor_cores | default(ansible_processor_count) | default(0) }}"
+#         cores_logical: "{{ ansible_processor_vcpus | default(0) }}"
+#         frequency_mhz: "{{ ansible_facts['processor_mhz'] | default(0) }}"
+#         load_average:
+#           _1m: "{{ ansible_load['1m'] | default(0) }}"
+#           _5m: "{{ ansible_load['5m'] | default(0) }}"
+#           _15m: "{{ ansible_load['15m'] | default(0) }}"
+#         usage_percent:
+#           idle: null_value
+#           user: null_value
+#           system: null_value
+#           iowait: null_value
+
+# #####################################################################
+# # MEMORY DETAILS
+# #####################################################################
+
+# - name: Build memory details
+#   set_fact:
+#     memory_info:
+#       memory_details:
+#         total_mb: "{{ ansible_memtotal_mb | default(0) | int }}"
+#         used_mb: "{{ (ansible_memtotal_mb | default(0) | int) - (ansible_memfree_mb | default(0) | int) }}"
+#         free_mb: "{{ ansible_memfree_mb | default(0) | int }}"
+#         available_mb: "{{ ansible_memavailable_mb | default(ansible_memfree_mb | default(0)) | int }}"
+#         usage_percent: "{{ (((ansible_memtotal_mb | default(1) | int) - (ansible_memfree_mb | default(0) | int)) / (ansible_memtotal_mb | default(1) | int) * 100) | round(1) }}"
+#         swap:
+#           total_mb: "{{ ansible_swaptotal_mb | default(0) | int }}"
+#           used_mb: "{{ (ansible_swaptotal_mb | default(0) | int) - (ansible_swapfree_mb | default(0) | int) }}"
+#           free_mb: "{{ ansible_swapfree_mb | default(0) | int }}"
+#           usage_percent: "{{ (((ansible_swaptotal_mb | default(0) | int) - (ansible_swapfree_mb | default(0) | int)) / (ansible_swaptotal_mb | default(1) | int) * 100) | round(1) if (ansible_swaptotal_mb | default(0) | int) > 0 else 0 }}"
+
+
+# #####################################################################
+# # DISK DETAILS - PER MOUNT POINT
+# #####################################################################
+
+# - name: Build disk details array
+#   set_fact:
+#     disk_details_array: []
+
+# - name: Create disk entry for each mount
+#   set_fact:
+#     disk_details_array: "{{ disk_details_array + [ {
+#         'mount_point': item.mount,
+#         'filesystem': item.fstype | default('unknown'),
+#         'total_gb': ((item.size_total | default(0) | int) / 1073741824) | round(2),
+#         'used_gb': (((item.size_total | default(0) | int) - (item.size_available | default(0) | int)) / 1073741824) | round(2),
+#         'free_gb': ((item.size_available | default(0) | int) / 1073741824) | round(2),
+#         'usage_percent': ((((item.size_total | default(0) | int) - (item.size_available | default(0) | int)) / (item.size_total | default(1) | int) * 100)) | round(1) if (item.size_total | default(0) | int) > 0 else 0,
+#         'read_iops': null_value,
+#         'write_iops': null_value,
+#         'read_throughput_mb_s': null_value,
+#         'write_throughput_mb_s': null_value
+#       } ] }}"
+#   loop: "{{ ansible_mounts | default([]) }}"
+#   when:
+#     - item.mount is defined
+#     - item.size_total is defined
+
+# - name: Build disk details structure
+#   set_fact:
+#     disk_info:
+#       disk_details: "{{ disk_details_array }}"
+
+
+# #####################################################################
+# # Merge Everything into server_details
+# #####################################################################
+
+# - name: Merge system discovery into server_details
+#   set_fact:
+#     server_details: >-
+#       {{
+#         server_details
+#         | combine(cpu_info, recursive=True)
+#         | combine(memory_info, recursive=True)
+#         | combine(disk_info, recursive=True)
+#       }}
+
+
+
 # playbooks/linux/system_discovery.yml
 ---
 #####################################################################
@@ -9,6 +118,14 @@
 #####################################################################
 
 #####################################################################
+# Initialize common variables
+#####################################################################
+
+- name: Initialize null value for JSON output
+  set_fact:
+    null_value: ~
+
+#####################################################################
 # CPU DETAILS
 #####################################################################
 
@@ -16,67 +133,59 @@
   set_fact:
     cpu_info:
       cpu_details:
-        model: "{{ ansible_processor[1] | default('Unknown') }}"
-        cores: "{{ ansible_processor_cores | default(0) }}"
-        threads: "{{ ansible_processor_vcpus | default(0) }}"
-        usage_percent: null   # Real-time usage needs custom command (optional)
+        model: "{{ ansible_processor[1] | default(ansible_processor[0] | default('Unknown')) }}"
+        cores_physical: "{{ ansible_processor_cores | default(ansible_processor_count) | default(0) }}"
+        cores_logical: "{{ ansible_processor_vcpus | default(0) }}"
+        frequency_mhz: "{{ ansible_facts['processor_mhz'] | default(0) }}"
+        load_average:
+          _1m: "{{ ansible_load['1m'] | default(0) }}"
+          _5m: "{{ ansible_load['5m'] | default(0) }}"
+          _15m: "{{ ansible_load['15m'] | default(0) }}"
+        usage_percent:
+          idle: null_value
+          user: null_value
+          system: null_value
+          iowait: null_value
 
 #####################################################################
 # MEMORY DETAILS
 #####################################################################
 
-- name: Convert memory values to GB
+- name: Build memory details
   set_fact:
     memory_info:
       memory_details:
-        total_gb: "{{ ((ansible_memtotal_mb | int) / 1024) | round(2) }}"
-        used_gb: "{{ (((ansible_memtotal_mb | int) - (ansible_memfree_mb | int)) / 1024) | round(2) }}"
-        free_gb: "{{ ((ansible_memfree_mb | int) / 1024) | round(2) }}"
-        swap_total_gb: "{{ ((ansible_swaptotal_mb | int) / 1024) | round(2) }}"
-        swap_used_gb: "{{ (((ansible_swaptotal_mb | int) - (ansible_swapfree_mb | int)) / 1024) | round(2) }}"
-
+        total_mb: "{{ ansible_memtotal_mb | default(0) | int }}"
+        used_mb: "{{ (ansible_memtotal_mb | default(0) | int) - (ansible_memfree_mb | default(0) | int) }}"
+        free_mb: "{{ ansible_memfree_mb | default(0) | int }}"
+        available_mb: "{{ ansible_memavailable_mb | default(ansible_memfree_mb | default(0)) | int }}"
+        usage_percent: "{{ (((ansible_memtotal_mb | default(1) | int) - (ansible_memfree_mb | default(0) | int)) / (ansible_memtotal_mb | default(1) | int) * 100) | round(1) }}"
+        swap:
+          total_mb: "{{ ansible_swaptotal_mb | default(0) | int }}"
+          used_mb: "{{ (ansible_swaptotal_mb | default(0) | int) - (ansible_swapfree_mb | default(0) | int) }}"
+          free_mb: "{{ ansible_swapfree_mb | default(0) | int }}"
+          usage_percent: "{{ (((ansible_swaptotal_mb | default(0) | int) - (ansible_swapfree_mb | default(0) | int)) / (ansible_swaptotal_mb | default(1) | int) * 100) | round(1) if (ansible_swaptotal_mb | default(0) | int) > 0 else 0 }}"
 
 #####################################################################
-# DISK DETAILS - PARTITIONS
+# DISK DETAILS - PER MOUNT POINT
 #####################################################################
 
-- name: Initialize partition list
+- name: Build disk details array
   set_fact:
-    partition_list: []
+    disk_details_array: []
 
-- name: Build partition details
+- name: Create disk entry for each mount
   set_fact:
-    partition_list: "{{ partition_list + [ {
-        'mount': item.mount,
-        'total_gb': ((item.size_total | int) / 1073741824) | round(2),
-        'used_gb': (((item.size_total | int) - (item.size_available | int)) / 1073741824) | round(2)
-      } ] }}"
+    disk_details_array: "{{ disk_details_array + [{'mount_point': item.mount, 'filesystem': item.fstype | default('unknown'), 'total_gb': ((item.size_total | default(0) | int) / 1073741824) | round(2), 'used_gb': (((item.size_total | default(0) | int) - (item.size_available | default(0) | int)) / 1073741824) | round(2), 'free_gb': ((item.size_available | default(0) | int) / 1073741824) | round(2), 'usage_percent': ((((item.size_total | default(0) | int) - (item.size_available | default(0) | int)) / (item.size_total | default(1) | int) * 100)) | round(1) if (item.size_total | default(0) | int) > 0 else 0, 'read_iops': null_value, 'write_iops': null_value, 'read_throughput_mb_s': null_value, 'write_throughput_mb_s': null_value}] }}"
   loop: "{{ ansible_mounts | default([]) }}"
-  when: item.mount is defined
-
-
-#####################################################################
-# DISK TOTAL CALCULATION
-#####################################################################
-
-- name: Calculate total disk values
-  set_fact:
-    disk_total_bytes: "{{ (ansible_mounts | map(attribute='size_total') | sum(start=0)) | int }}"
-    disk_available_bytes: "{{ (ansible_mounts | map(attribute='size_available') | sum(start=0)) | int }}"
-
-- name: Calculate used disk bytes
-  set_fact:
-    disk_used_bytes: "{{ (disk_total_bytes | int) - (disk_available_bytes | int) }}"
+  when:
+    - item.mount is defined
+    - item.size_total is defined
 
 - name: Build disk details structure
   set_fact:
     disk_info:
-      disk_details:
-        total_gb: "{{ ((disk_total_bytes | int) / 1073741824) | round(2) }}"
-        used_gb: "{{ ((disk_used_bytes | int) / 1073741824) | round(2) }}"
-        free_gb: "{{ ((disk_available_bytes | int) / 1073741824) | round(2) }}"
-        partitions: "{{ partition_list }}"
-
+      disk_details: "{{ disk_details_array }}"
 
 #####################################################################
 # Merge Everything into server_details

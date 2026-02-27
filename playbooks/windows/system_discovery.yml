@@ -15,10 +15,21 @@
 - name: Get CPU details
   win_shell: |
     $cpu = Get-CimInstance Win32_Processor
+    $os = Get-CimInstance Win32_OperatingSystem
+
+    # Get CPU load percentage (processor queue length approximation)
+    $load1 = 0
+    $load5 = 0
+    $load15 = 0
+
     [PSCustomObject]@{
         Model = $cpu.Name
-        Cores = $cpu.NumberOfCores
-        Threads = $cpu.NumberOfLogicalProcessors
+        CoresPhysical = $cpu.NumberOfCores
+        CoresLogical = $cpu.NumberOfLogicalProcessors
+        FrequencyMHz = $cpu.MaxClockSpeed
+        Load1m = $load1
+        Load5m = $load5
+        Load15m = $load15
     } | ConvertTo-Json -Compress
   register: win_cpu
 
@@ -27,9 +38,18 @@
     cpu_info:
       cpu_details:
         model: "{{ (win_cpu.stdout | from_json).Model }}"
-        cores: "{{ (win_cpu.stdout | from_json).Cores }}"
-        threads: "{{ (win_cpu.stdout | from_json).Threads }}"
-        usage_percent: null
+        cores_physical: "{{ (win_cpu.stdout | from_json).CoresPhysical }}"
+        cores_logical: "{{ (win_cpu.stdout | from_json).CoresLogical }}"
+        frequency_mhz: "{{ (win_cpu.stdout | from_json).FrequencyMHz }}"
+        load_average:
+          _1m: "{{ (win_cpu.stdout | from_json).Load1m }}"
+          _5m: "{{ (win_cpu.stdout | from_json).Load5m }}"
+          _15m: "{{ (win_cpu.stdout | from_json).Load15m }}"
+        usage_percent:
+          idle: null
+          user: null
+          system: null
+          iowait: null
 
 #####################################################################
 # MEMORY DETAILS
@@ -38,9 +58,28 @@
 - name: Get Memory details
   win_shell: |
     $os = Get-CimInstance Win32_OperatingSystem
+    $cs = Get-CimInstance Win32_ComputerSystem
+
+    $totalMB = [math]::Round($os.TotalVisibleMemorySize, 0)
+    $freeMB = [math]::Round($os.FreePhysicalMemory, 0)
+    $usedMB = $totalMB - $freeMB
+
+    # Calculate page file (swap) usage
+    $pageFile = Get-CimInstance Win32_PageFileUsage
+    $swapTotalMB = if ($pageFile) { [math]::Round(($pageFile | Measure-Object -Property AllocatedBaseSize -Sum).Sum, 0) } else { 0 }
+    $swapFreeMB = if ($pageFile) { [math]::Round(($pageFile | Measure-Object -Property FreeSpace -Sum).Sum, 0) } else { 0 }
+    $swapUsedMB = $swapTotalMB - $swapFreeMB
+
     [PSCustomObject]@{
-        TotalGB = [math]::Round($os.TotalVisibleMemorySize / 1MB, 2)
-        FreeGB  = [math]::Round($os.FreePhysicalMemory / 1MB, 2)
+        TotalMB = $totalMB
+        UsedMB = $usedMB
+        FreeMB = $freeMB
+        AvailableMB = $freeMB
+        UsagePercent = [math]::Round(($usedMB / $totalMB) * 100, 1)
+        SwapTotalMB = $swapTotalMB
+        SwapUsedMB = $swapUsedMB
+        SwapFreeMB = $swapFreeMB
+        SwapUsagePercent = if ($swapTotalMB -gt 0) { [math]::Round(($swapUsedMB / $swapTotalMB) * 100, 1) } else { 0 }
     } | ConvertTo-Json -Compress
   register: win_memory
 
@@ -48,55 +87,48 @@
   set_fact:
     memory_info:
       memory_details:
-        total_gb: "{{ (win_memory.stdout | from_json).TotalGB }}"
-        free_gb: "{{ (win_memory.stdout | from_json).FreeGB }}"
-        used_gb: "{{ ((win_memory.stdout | from_json).TotalGB | float - (win_memory.stdout | from_json).FreeGB | float) | round(2) }}"
-        swap_total_gb: null
-        swap_used_gb: null
+        total_mb: "{{ (win_memory.stdout | from_json).TotalMB }}"
+        used_mb: "{{ (win_memory.stdout | from_json).UsedMB }}"
+        free_mb: "{{ (win_memory.stdout | from_json).FreeMB }}"
+        available_mb: "{{ (win_memory.stdout | from_json).AvailableMB }}"
+        usage_percent: "{{ (win_memory.stdout | from_json).UsagePercent }}"
+        swap:
+          total_mb: "{{ (win_memory.stdout | from_json).SwapTotalMB }}"
+          used_mb: "{{ (win_memory.stdout | from_json).SwapUsedMB }}"
+          free_mb: "{{ (win_memory.stdout | from_json).SwapFreeMB }}"
+          usage_percent: "{{ (win_memory.stdout | from_json).SwapUsagePercent }}"
 
 #####################################################################
-# DISK DETAILS
-#####################################################################
-
-#####################################################################
-# DISK DETAILS (Stable Version)
-#####################################################################
-#####################################################################
-# DISK DETAILS (Stable Version)
+# DISK DETAILS - PER DRIVE
 #####################################################################
 
 - name: Get Disk details
   win_shell: |
     $disks = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3"
 
-    $partitions = @()
-    $total = 0
-    $free  = 0
-    $used  = 0
+    $diskArray = @()
 
     foreach ($disk in $disks) {
-
         $totalGB = [math]::Round($disk.Size / 1GB, 2)
-        $freeGB  = [math]::Round($disk.FreeSpace / 1GB, 2)
-        $usedGB  = [math]::Round(($disk.Size - $disk.FreeSpace) / 1GB, 2)
+        $freeGB = [math]::Round($disk.FreeSpace / 1GB, 2)
+        $usedGB = [math]::Round(($disk.Size - $disk.FreeSpace) / 1GB, 2)
+        $usagePercent = if ($disk.Size -gt 0) { [math]::Round(($usedGB / $totalGB) * 100, 1) } else { 0 }
 
-        $total += $totalGB
-        $free  += $freeGB
-        $used  += $usedGB
-
-        $partitions += [PSCustomObject]@{
-            mount    = $disk.DeviceID
+        $diskArray += [PSCustomObject]@{
+            mount_point = $disk.DeviceID
+            filesystem = $disk.FileSystem
             total_gb = $totalGB
-            used_gb  = $usedGB
+            used_gb = $usedGB
+            free_gb = $freeGB
+            usage_percent = $usagePercent
+            read_iops = $null
+            write_iops = $null
+            read_throughput_mb_s = $null
+            write_throughput_mb_s = $null
         }
     }
 
-    [PSCustomObject]@{
-        total_gb  = [math]::Round($total,2)
-        free_gb   = [math]::Round($free,2)
-        used_gb   = [math]::Round($used,2)
-        partitions = $partitions
-    } | ConvertTo-Json -Depth 5 -Compress
+    $diskArray | ConvertTo-Json -Compress
   register: win_disk_data
 
 - name: Set disk details fact
@@ -104,26 +136,6 @@
     disk_info:
       disk_details: "{{ win_disk_data.stdout | from_json }}"
 
-
-#####################################################################
-# Normalize Partition Format
-#####################################################################
-
-# - name: Normalize partition structure
-#   set_fact:
-#     disk_info:
-#       disk_details:
-#         total_gb: "{{ disk_info.disk_details.total_gb }}"
-#         used_gb: "{{ disk_info.disk_details.used_gb }}"
-#         free_gb: "{{ disk_info.disk_details.free_gb }}"
-#         partitions: >-
-#           {{
-#             partition_list | map('extract', {
-#               'mount': 'Mount',
-#               'total_gb': 'TotalGB',
-#               'used_gb': 'UsedGB'
-#             })
-#           }}
 
 #####################################################################
 # Merge Everything into server_details

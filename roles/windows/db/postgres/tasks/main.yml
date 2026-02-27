@@ -1,0 +1,392 @@
+---
+#################################################################
+# PostgreSQL Discovery Role Tasks (Windows)
+#################################################################
+
+# ========================================
+# STEP 0: Snapshot all PostgreSQL processes
+# ========================================
+- name: Debug - Show all PostgreSQL-related processes
+  win_shell: |
+    Write-Output "=== All PostgreSQL-related processes ==="
+    Get-CimInstance Win32_Process -Filter "Name LIKE '%postgres%'" |
+    Select-Object ProcessId, Name, CommandLine, ExecutablePath |
+    Format-List
+  register: postgres_debug
+  changed_when: false
+  failed_when: false
+
+- name: Show debug output
+  debug:
+    msg: "{{ postgres_debug.stdout }}"
+
+# ========================================
+# STEP 1: Extract unique binary paths from running processes
+# PostgreSQL spawns many worker processes all pointing to the
+# same postgres.exe, so we deduplicate by ExecutablePath.
+# ========================================
+- name: Extract unique PostgreSQL binaries from running processes
+  win_shell: |
+    # Only postgres.exe is the actual server process.
+    # pg_ctl.exe is a control utility - including it causes duplicate discovery entries.
+    Get-CimInstance Win32_Process -Filter "Name='postgres.exe'" |
+    Select-Object -ExpandProperty ExecutablePath |
+    Where-Object { $_ -ne $null -and $_ -ne '' } |
+    Sort-Object -Unique
+  register: unique_binaries
+  changed_when: false
+  failed_when: false
+
+- name: Set unique binaries fact
+  set_fact:
+    postgres_unique_binaries: "{{ unique_binaries.stdout_lines | default([]) | select('search', 'postgres.exe') | list }}"
+
+- name: Debug - Show captured binaries
+  debug:
+    msg: "PostgreSQL binaries found: {{ postgres_unique_binaries }}"
+
+# ========================================
+# FALLBACK: Discover binary path from Windows Service
+# PostgreSQL installer always registers a service like
+# postgresql-x64-16, postgresql-x64-15, etc.
+# ========================================
+- name: Find PostgreSQL services and extract binary path
+  win_shell: |
+    $svc = Get-CimInstance Win32_Service -Filter "Name LIKE 'postgresql%' OR DisplayName LIKE '%PostgreSQL%'"
+    if (-not $svc) {
+      Write-Output ""
+      exit 0
+    }
+    $found = @()
+    foreach ($s in $svc) {
+      $path = $s.PathName -replace '^"', '' -replace '".*$', ''
+      # Resolve the bin directory from whatever exe the service points to
+      if ($path -match '^(.+\.exe)') {
+        $exePath = $matches[1].Trim()
+        $binDir  = Split-Path -Parent $exePath
+        # Always resolve to postgres.exe - that is the canonical server binary
+        $pgExe = Join-Path $binDir "postgres.exe"
+        if ((Test-Path $pgExe) -and ($found -notcontains $pgExe)) {
+          $found += $pgExe
+        }
+      }
+    }
+    $found | Sort-Object -Unique
+  register: service_binary_discovery
+  changed_when: false
+  failed_when: false
+  when: postgres_unique_binaries | length == 0
+
+- name: Debug - Service binary discovery result
+  debug:
+    msg: "Service binary discovery: {{ service_binary_discovery.stdout_lines | default([]) }}"
+  when: postgres_unique_binaries | length == 0
+
+- name: Add service binaries to list if no processes found
+  set_fact:
+    postgres_unique_binaries: "{{ service_binary_discovery.stdout_lines | select('search', '.exe') | list }}"
+  when:
+    - postgres_unique_binaries | length == 0
+    - service_binary_discovery.stdout_lines is defined
+    - service_binary_discovery.stdout_lines | select('search', '.exe') | list | length > 0
+
+- name: Debug - Final binaries list
+  debug:
+    msg: "Final PostgreSQL binaries: {{ postgres_unique_binaries }}"
+
+# ========================================
+# STEP 2: Write PowerShell collector script to disk
+# Using win_copy avoids ALL Jinja2/YAML quote-stripping issues.
+# ========================================
+- name: Write PostgreSQL data collector script to disk
+  win_copy:
+    dest: C:\Windows\Temp\postgres_collect.ps1
+    content: |
+      param([string]$BinaryPath)
+      $ErrorActionPreference = 'SilentlyContinue'
+
+      $BINARY = $BinaryPath.Trim()
+      if (-not $BINARY -or $BINARY -eq '') {
+        Write-Output "BINARY=NONE^^^PIDS=none^^^VERSION=unknown^^^CONFIG=not-found^^^DATADIR=not-found^^^PORTS=5432^^^LOGPATH=not-found^^^BINDIR=^^^SERVICE=not-found"
+        exit 0
+      }
+
+      $BIN_DIR = Split-Path -Parent $BINARY
+
+      # ---- PIDs ----
+      # Escape backslashes and single-quotes for WMI CQL filter
+      $escapedForWMI = $BINARY -replace "\\", "\\\\" -replace "'", "\\'"
+      $processes = Get-CimInstance Win32_Process -Filter "ExecutablePath = '$escapedForWMI'"
+      $PIDs = @($processes | ForEach-Object { $_.ProcessId })
+      $PIDS_STRING = if ($PIDs.Count -gt 0) { ($PIDs -join ',') } else { "none" }
+
+      # ---- VERSION from file metadata ----
+      $VERSION = "unknown"
+      if (Test-Path $BINARY) {
+        try {
+          $fi = Get-Item $BINARY -ErrorAction Stop
+          $v  = $fi.VersionInfo.FileVersion
+          if (-not $v -or $v -eq '') { $v = $fi.VersionInfo.ProductVersion }
+          if ($v -and $v -ne '') { $VERSION = $v.Trim() }
+        } catch {}
+      }
+      # Fallback: pg_ctl or postgres --version
+      if ($VERSION -eq "unknown") {
+        $pgCtl = Join-Path $BIN_DIR "pg_ctl.exe"
+        $pgBin = if (Test-Path $pgCtl) { $pgCtl } elseif (Test-Path $BINARY) { $BINARY } else { $null }
+        if ($pgBin) {
+          try {
+            $vOut = & "$pgBin" --version 2>&1 | Out-String
+            if ($vOut -match 'PostgreSQL\)\s+(\d+[\d.]+)') {
+              $VERSION = $matches[1]
+            } elseif ($vOut -match '(\d+\.\d+[\.\d]*)') {
+              $VERSION = $matches[1]
+            }
+          } catch {}
+        }
+      }
+
+      # ---- DATADIR from process command line ----
+      # PostgreSQL postmaster is the parent process; it carries -D <datadir>
+      $DATADIR     = "not-found"
+      $CONFIG_PATH = "not-found"
+      $LOGPATH     = "not-found"
+
+      if ($PIDs.Count -gt 0) {
+        foreach ($proc in $processes) {
+          $cmdLine = $proc.CommandLine
+          if (-not $cmdLine) { continue }
+          # Postmaster / postgres -D <datadir>
+          if ($cmdLine -match '\s-D\s+"([^"]+)"') {
+            $d = $matches[1]; if (Test-Path $d) { $DATADIR = $d; break }
+          } elseif ($cmdLine -match "\s-D\s+'([^']+)'") {
+            $d = $matches[1]; if (Test-Path $d) { $DATADIR = $d; break }
+          } elseif ($cmdLine -match '\s-D\s+(\S+)') {
+            $d = $matches[1]; if (Test-Path $d) { $DATADIR = $d; break }
+          }
+        }
+      }
+
+      # ---- DATADIR fallback: scan service PathName for -D flag ----
+      if ($DATADIR -eq "not-found") {
+        $pgSvcs = Get-CimInstance Win32_Service -Filter "Name LIKE 'postgresql%'" -ErrorAction SilentlyContinue
+        foreach ($s in $pgSvcs) {
+          $sp = $s.PathName
+          if ($sp -match '-D\s+"([^"]+)"') {
+            $d = $matches[1]; if (Test-Path $d) { $DATADIR = $d; break }
+          } elseif ($sp -match "-D\s+'([^']+)'") {
+            $d = $matches[1]; if (Test-Path $d) { $DATADIR = $d; break }
+          } elseif ($sp -match '-D\s+(\S+)') {
+            $d = $matches[1]; if (Test-Path $d) { $DATADIR = $d; break }
+          }
+        }
+      }
+
+      # ---- DATADIR fallback: well-known install paths ----
+      if ($DATADIR -eq "not-found") {
+        $candidates = @(
+          'C:\Program Files\PostgreSQL\17\data',
+          'C:\Program Files\PostgreSQL\16\data',
+          'C:\Program Files\PostgreSQL\15\data',
+          'C:\Program Files\PostgreSQL\14\data',
+          'C:\Program Files\PostgreSQL\13\data',
+          'C:\Program Files\PostgreSQL\12\data',
+          'C:\PostgreSQL\data',
+          'C:\pgsql\data'
+        )
+        foreach ($d in $candidates) {
+          if (Test-Path (Join-Path $d "postgresql.conf")) { $DATADIR = $d; break }
+        }
+      }
+
+      # ---- CONFIG from datadir ----
+      if ($DATADIR -ne "not-found") {
+        $pgConf = Join-Path $DATADIR "postgresql.conf"
+        if (Test-Path $pgConf) { $CONFIG_PATH = $pgConf }
+      }
+
+      # ---- LOGPATH: from postgresql.conf, then common log dirs ----
+      if ($CONFIG_PATH -ne "not-found") {
+        $cfgContent = Get-Content $CONFIG_PATH -ErrorAction SilentlyContinue
+        $logDir = $null
+        $logFilename = $null
+        foreach ($line in $cfgContent) {
+          # Skip commented lines
+          if ($line -match '^\s*#') { continue }
+          if ($line -match "^\s*log_directory\s*=\s*'([^']+)'")  { $logDir = $matches[1].Trim() }
+          if ($line -match '^\s*log_directory\s*=\s*"([^"]+)"')  { $logDir = $matches[1].Trim() }
+          if ($line -match '^\s*log_directory\s*=\s*(\S+)')      { $logDir = $matches[1].Trim() }
+          if ($line -match "^\s*log_filename\s*=\s*'([^']+)'")   { $logFilename = $matches[1].Trim() }
+          if ($line -match '^\s*log_filename\s*=\s*"([^"]+)"')   { $logFilename = $matches[1].Trim() }
+          if ($line -match '^\s*log_filename\s*=\s*(\S+)')       { $logFilename = $matches[1].Trim() }
+        }
+        if ($logDir) {
+          # Relative paths are relative to DATADIR
+          if (-not [System.IO.Path]::IsPathRooted($logDir)) {
+            $logDir = Join-Path $DATADIR $logDir
+          }
+          if (Test-Path $logDir) {
+            $LOGPATH = $logDir
+          }
+        }
+      }
+      # Last resort: check pg_log and log subdirs inside DATADIR
+      if ($LOGPATH -eq "not-found" -and $DATADIR -ne "not-found") {
+        foreach ($sub in @("log", "pg_log")) {
+          $ld = Join-Path $DATADIR $sub
+          if (Test-Path $ld) { $LOGPATH = $ld; break }
+        }
+      }
+
+      # ---- PORT: from postgresql.conf, then sockets, then netstat ----
+      $PORTS = @()
+
+      # From config file (most reliable)
+      if ($CONFIG_PATH -ne "not-found") {
+        $cfgContent = Get-Content $CONFIG_PATH -ErrorAction SilentlyContinue
+        foreach ($line in $cfgContent) {
+          if ($line -match '^\s*#') { continue }
+          if ($line -match '^\s*port\s*=\s*(\d+)') {
+            $PORTS += [int]$matches[1]; break
+          }
+        }
+      }
+
+      # From listening sockets
+      if ($PORTS.Count -eq 0) {
+        foreach ($p in $PIDs) {
+          $conns = Get-NetTCPConnection -OwningProcess $p -State Listen -ErrorAction SilentlyContinue
+          foreach ($c in $conns) { if ($c.LocalPort) { $PORTS += $c.LocalPort } }
+        }
+      }
+
+      # netstat fallback
+      if ($PORTS.Count -eq 0 -and $PIDs.Count -gt 0) {
+        $nsLines = netstat -ano 2>$null
+        foreach ($line in $nsLines) {
+          foreach ($p in $PIDs) {
+            if ($line -match "TCP\s+[^\s]+:(\d+)\s+[^\s]+\s+LISTENING\s+${p}\s*$") {
+              $PORTS += [int]$matches[1]
+            }
+          }
+        }
+      }
+
+      $PORTS = @($PORTS | Select-Object -Unique | Sort-Object)
+      $PORTS_STRING = if ($PORTS.Count -gt 0) { ($PORTS -join ',') } else { "5432" }
+
+      # ---- SERVICE NAME + STATE ----
+      $SERVICE_NAME  = "not-found"
+      $SERVICE_STATE = "Stopped"
+      $pgSvcs = Get-CimInstance Win32_Service -Filter "Name LIKE 'postgresql%'" -ErrorAction SilentlyContinue
+      foreach ($s in $pgSvcs) {
+        $sPath = $s.PathName -replace '"', ''
+        if ($sPath -like "*postgres*" -or $sPath -like "*pg_ctl*") {
+          $SERVICE_NAME  = $s.Name
+          $SERVICE_STATE = $s.State   # "Running" or "Stopped"
+          break
+        }
+      }
+
+      # ---- EXTRA: pg_hba.conf path ----
+      $HBA_PATH = "not-found"
+      if ($DATADIR -ne "not-found") {
+        $hba = Join-Path $DATADIR "pg_hba.conf"
+        if (Test-Path $hba) { $HBA_PATH = $hba }
+      }
+
+      Write-Output "BINARY=$BINARY^^^PIDS=$PIDS_STRING^^^VERSION=$VERSION^^^CONFIG=$CONFIG_PATH^^^DATADIR=$DATADIR^^^PORTS=$PORTS_STRING^^^LOGPATH=$LOGPATH^^^BINDIR=$BIN_DIR^^^SERVICE=$SERVICE_NAME^^^SERVICESTATE=$SERVICE_STATE^^^HBA=$HBA_PATH"
+  changed_when: false
+
+# ========================================
+# STEP 3: Execute the script for each binary
+# ========================================
+- name: Debug - Show binary being processed
+  debug:
+    msg: "Processing PostgreSQL binary: {{ item }}"
+  loop: "{{ postgres_unique_binaries }}"
+  when: postgres_unique_binaries | length > 0
+
+- name: Collect all data for each unique binary
+  win_shell: "& 'C:\\Windows\\Temp\\postgres_collect.ps1' -BinaryPath '{{ item }}'"
+  args:
+    executable: powershell.exe
+  register: postgres_data_collection
+  changed_when: false
+  failed_when: false
+  loop: "{{ postgres_unique_binaries }}"
+  when: postgres_unique_binaries | length > 0
+
+- name: Debug - Show data collection results
+  debug:
+    msg: "stdout: [{{ item.stdout | default('EMPTY') }}] | rc: {{ item.rc | default('?') }} | stderr: {{ item.stderr | default('NONE') }}"
+  loop: "{{ postgres_data_collection.results | default([]) }}"
+  when: postgres_unique_binaries | length > 0
+
+# ========================================
+# STEP 4: Clean up temp script
+# ========================================
+- name: Remove temp collector script
+  win_file:
+    path: C:\Windows\Temp\postgres_collect.ps1
+    state: absent
+  changed_when: false
+  failed_when: false
+
+# ========================================
+# STEP 5: Parse into JSON
+# ========================================
+- name: Initialize discovery array
+  set_fact:
+    discovery_array: []
+
+- name: Parse each instance
+  set_fact:
+    discovery_array: "{{ discovery_array + [json_instance] }}"
+  vars:
+    data_line: "{{ item.stdout_lines | select('search', '^BINARY=') | list | first | default('') }}"
+
+    binary_path:  "{{ (data_line | regex_search('BINARY=([^^]+)', '\\1') or [''])[0] | trim }}"
+    pids_raw:     "{{ (data_line | regex_search('PIDS=([^^]+)', '\\1') or [''])[0] | trim }}"
+    version:      "{{ (data_line | regex_search('VERSION=([^^]+)', '\\1') or ['unknown'])[0] | trim }}"
+    config_path:  "{{ (data_line | regex_search('CONFIG=([^^]+)', '\\1') or ['not-found'])[0] | trim }}"
+    datadir:      "{{ (data_line | regex_search('DATADIR=([^^]+)', '\\1') or ['not-found'])[0] | trim }}"
+    ports_raw:    "{{ (data_line | regex_search('PORTS=([^^]+)', '\\1') or ['5432'])[0] | trim }}"
+    logpath:      "{{ (data_line | regex_search('LOGPATH=([^^]+)', '\\1') or ['not-found'])[0] | trim }}"
+    service_name:  "{{ (data_line | regex_search('SERVICE=([^^]+)', '\\1') or ['not-found'])[0] | trim }}"
+    service_state: "{{ (data_line | regex_search('SERVICESTATE=([^^]+)', '\\1') or ['Stopped'])[0] | trim }}"
+    hba_path:      "{{ (data_line | regex_search('HBA=([^^]+)', '\\1') or ['not-found'])[0] | trim }}"
+
+    pids_array:  "{{ pids_raw.split(',') | map('int') | list if pids_raw not in ['', 'none'] else [] }}"
+    ports_array: "{{ ports_raw.split(',') | map('int') | list if ports_raw not in ['', 'none'] else [5432] }}"
+
+    json_instance:
+      service_type: "DATABASE"
+      service_name: "postgresql"
+      service_version: "{{ version }}"
+      port: "{{ ports_array[0] if ports_array | length > 0 else 5432 }}"
+      pid:  "{{ pids_array[0] if pids_array | length > 0 else 0 }}"
+      paths:
+        binary_path: "{{ binary_path }}"
+        config_path: "{{ config_path if config_path != 'not-found' else None }}"
+        data_path:   "{{ datadir if datadir != 'not-found' else None }}"
+        log_path:    "{{ logpath if logpath != 'not-found' else None }}"
+        hba_path:    "{{ hba_path if hba_path != 'not-found' else None }}"
+      additional_details:
+        all_ports:    "{{ ports_array }}"
+        all_pids:     "{{ pids_array }}"
+        service_name: "{{ service_name if service_name != 'not-found' else None }}"
+      # RUNNING if process PIDs found OR if the Windows service state is Running
+      status: "{{ 'RUNNING' if (pids_array | length > 0 or service_state == 'Running') else 'STOPPED' }}"
+  loop: "{{ postgres_data_collection.results | default([]) }}"
+  when:
+    - item.stdout is defined
+    - item.stdout | trim != ''
+    - item.stdout_lines | select('search', '^BINARY=') | list | length > 0
+
+#################################################################
+# Append PostgreSQL services to global discovered_services
+#################################################################
+- name: Append PostgreSQL services to discovered_services
+  set_fact:
+    discovered_services: "{{ discovered_services + (discovery_array | default([])) }}"

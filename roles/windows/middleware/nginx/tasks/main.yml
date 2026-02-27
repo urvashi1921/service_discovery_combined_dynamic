@@ -1,0 +1,403 @@
+---
+#################################################################
+# Nginx Discovery Role Tasks (Windows)
+#################################################################
+
+# ========================================
+# STEP 0: Snapshot all Nginx processes
+# ========================================
+- name: Debug - Show all Nginx-related processes
+  win_shell: |
+    Write-Output "=== All Nginx-related processes ==="
+    Get-CimInstance Win32_Process -Filter "Name LIKE '%nginx%' OR Name LIKE '%nginx.exe%'" |
+    Select-Object ProcessId, Name, CommandLine, ExecutablePath |
+    Format-List
+  register: nginx_debug
+  changed_when: false
+  failed_when: false
+
+- name: Show debug output
+  debug:
+    msg: "{{ nginx_debug.stdout }}"
+  when: nginx_debug.stdout is defined
+
+# ========================================
+# STEP 1: Extract unique Nginx instances from running processes
+# ========================================
+- name: Extract unique Nginx instances from running processes
+  win_shell: |
+    $processes = Get-CimInstance Win32_Process -Filter "Name='nginx.exe'" -ErrorAction SilentlyContinue
+
+    if (-not $processes) {
+      $processes = Get-CimInstance Win32_Process -Filter "Name LIKE '%nginx%'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like '*master*' -or $_.CommandLine -like '*nginx*' }
+    }
+
+    $uniqueInstances = @()
+    foreach ($proc in $processes) {
+      $cmdLine = $proc.CommandLine
+      $binaryPath = $proc.ExecutablePath
+
+      $configPath = ""
+      if ($cmdLine -match '-c\s+"?([^"\s]+)"?') {
+        $configPath = $matches[1]
+      }
+
+      $instanceId = "$binaryPath|$configPath"
+      if ($uniqueInstances -notcontains $instanceId -and -not [string]::IsNullOrEmpty($binaryPath)) {
+        $uniqueInstances += $instanceId
+      }
+    }
+
+    $uniqueInstances | ForEach-Object { Write-Output $_ }
+  register: unique_instances
+  changed_when: false
+  failed_when: false
+
+- name: Set unique instances fact
+  set_fact:
+    nginx_unique_instances: "{{ unique_instances.stdout_lines | default([]) | select('search', '.+') | list }}"
+
+- name: Debug - Show captured instances
+  debug:
+    msg: "Nginx instances found: {{ nginx_unique_instances }}"
+
+# ========================================
+# FALLBACK: Discover Nginx from Windows Service
+# ========================================
+- name: Find Nginx services and extract binary paths
+  win_shell: |
+    $filterStr = 'Name LIKE "%nginx%" OR DisplayName LIKE "%nginx%"'
+    $svc = Get-CimInstance Win32_Service -Filter $filterStr -ErrorAction SilentlyContinue
+    if (-not $svc) {
+      Write-Output ""
+      exit 0
+    }
+
+    $uniquePaths = @()
+    foreach ($s in $svc) {
+      $path = $s.PathName
+      $path = $path -replace '^"', '' -replace '".*$', ''
+      $path = $path -replace '\s.*$', ''
+
+      if ($path -like '*nginx.exe' -and $uniquePaths -notcontains $path) {
+        $uniquePaths += $path
+        Write-Output "$path|"
+      }
+    }
+  register: service_discovery
+  changed_when: false
+  failed_when: false
+  when: nginx_unique_instances | length == 0
+
+- name: Debug - Service discovery result
+  debug:
+    msg: "Service discovery: {{ service_discovery.stdout_lines | default([]) }}"
+  when: nginx_unique_instances | length == 0
+
+- name: Add service instances to list if no processes found
+  set_fact:
+    nginx_unique_instances: "{{ service_discovery.stdout_lines | select('search', '.+') | list }}"
+  when:
+    - nginx_unique_instances | length == 0
+    - service_discovery.stdout_lines is defined
+    - service_discovery.stdout_lines | select('search', '.+') | list | length > 0
+
+- name: Debug - Final instances list
+  debug:
+    msg: "Final Nginx instances: {{ nginx_unique_instances }}"
+
+# ========================================
+# STEP 2: Write PowerShell collector script to disk
+# ========================================
+- name: Write Nginx data collector script to disk
+  win_copy:
+    dest: C:\Windows\Temp\nginx_collect.ps1
+    content: |
+      param(
+        [string]$BinaryPath,
+        [string]$ConfigPath
+      )
+
+      $ErrorActionPreference = 'SilentlyContinue'
+
+      $BINARY = $BinaryPath.Trim()
+      $CONFIG = $ConfigPath.Trim()
+
+      if (-not $BINARY -or $BINARY -eq '') {
+        Write-Output "BINARY=none^^^PIDS=none^^^VERSION=unknown^^^CONFIG=not-found^^^PREFIX=not-found^^^PORTS=none^^^MASTER_PID=none^^^BINDIR=^^^WORKER_PROCESSES=unknown^^^SERVICE=not-found^^^ERROR_LOG=not-found^^^CONFIG_PORTS=none"
+        exit 0
+      }
+
+      # ---- PIDs (master and worker processes) ----
+      $allProcesses = Get-CimInstance Win32_Process -Filter "Name='nginx.exe'" -ErrorAction SilentlyContinue
+
+      $PIDs = @()
+      $MASTER_PID = ""
+
+      foreach ($proc in $allProcesses) {
+        $cmdLine = $proc.CommandLine
+        $procBin = $proc.ExecutablePath
+
+        if ($procBin -eq $BINARY) {
+          $PIDs += $proc.ProcessId
+
+          if ($cmdLine -like '*master process*') {
+            $MASTER_PID = $proc.ProcessId
+          }
+        }
+      }
+
+      $PIDS_STRING = if ($PIDs.Count -gt 0) { ($PIDs -join ',') } else { "none" }
+      if ([string]::IsNullOrEmpty($MASTER_PID)) {
+        $MASTER_PID = if ($PIDs.Count -gt 0) { $PIDs[0] } else { "none" }
+      }
+
+      # ---- VERSION from binary ----
+      $VERSION = "unknown"
+      if (Test-Path $BINARY) {
+        try {
+          $versionOutput = & "$BINARY" -v 2>&1 | Out-String
+          if ($versionOutput -match 'nginx/\s*([0-9.]+)') {
+            $VERSION = $matches[1]
+          } elseif ($versionOutput -match 'nginx version:\s*nginx/([0-9.]+)') {
+            $VERSION = $matches[1]
+          }
+        } catch {
+          try {
+            $fi = Get-Item $BINARY
+            $v = $fi.VersionInfo.FileVersion
+            if ($v -and $v -ne '' -and $v -ne '0.0.0.0') { $VERSION = $v }
+          } catch {}
+        }
+      }
+
+      # ---- BIN DIRECTORY ----
+      $BIN_DIR = Split-Path -Parent $BINARY
+
+      # ---- PREFIX from nginx -V ----
+      $PREFIX = "not-found"
+      if (Test-Path $BINARY) {
+        try {
+          $vOutput = & "$BINARY" -V 2>&1 | Out-String
+          if ($vOutput -match '--prefix=([^\s]+)') {
+            $PREFIX = $matches[1]
+          } elseif ($vOutput -match '--conf-path=([^\s]+)') {
+            $confPath = $matches[1]
+            $PREFIX = Split-Path -Parent (Split-Path -Parent $confPath)
+          }
+
+          if ($PREFIX -eq "not-found") {
+            $PREFIX = Split-Path -Parent $BIN_DIR
+          }
+        } catch {
+          $PREFIX = Split-Path -Parent $BIN_DIR
+        }
+      }
+
+      # ---- CONFIG PATH ----
+      if ([string]::IsNullOrEmpty($CONFIG) -or $CONFIG -eq '') {
+        if (Test-Path $BINARY) {
+          try {
+            $vOutput = & "$BINARY" -V 2>&1 | Out-String
+            if ($vOutput -match '--conf-path=([^\s]+)') {
+              $CONFIG = $matches[1]
+            }
+          } catch {}
+        }
+
+        if ([string]::IsNullOrEmpty($CONFIG)) {
+          $configCandidates = @(
+            (Join-Path $PREFIX "conf\nginx.conf"),
+            "C:\nginx\conf\nginx.conf",
+            "C:\nginx\nginx.conf",
+            "C:\nginx-1.24.0\conf\nginx.conf"
+          )
+          foreach ($cfg in $configCandidates) {
+            if (Test-Path $cfg) {
+              $CONFIG = $cfg
+              break
+            }
+          }
+        }
+      }
+
+      if ([string]::IsNullOrEmpty($CONFIG)) {
+        $CONFIG = "not-found"
+      }
+
+      # ---- RUNTIME PORTS from listening sockets ----
+      $PORTS = @()
+      foreach ($p in $PIDs) {
+        $conns = Get-NetTCPConnection -OwningProcess $p -State Listen -ErrorAction SilentlyContinue
+        foreach ($c in $conns) {
+          if ($c.LocalPort) {
+            $PORTS += $c.LocalPort
+          }
+        }
+      }
+      $PORTS = @($PORTS | Select-Object -Unique | Sort-Object)
+      $PORTS_STRING = if ($PORTS.Count -gt 0) { ($PORTS -join ',') } else { "none" }
+
+      # ---- CONFIG PORTS from nginx.conf ----
+      $CONFIG_PORTS = @()
+      if ($CONFIG -ne "not-found" -and (Test-Path $CONFIG)) {
+        $confContent = Get-Content $CONFIG -ErrorAction SilentlyContinue
+        foreach ($line in $confContent) {
+          if ($line -match '^\s*listen\s+([0-9]+)') {
+            $CONFIG_PORTS += [int]$matches[1]
+          } elseif ($line -match '^\s*listen\s+.*?:([0-9]+)') {
+            $CONFIG_PORTS += [int]$matches[1]
+          } elseif ($line -match '^\s*listen\s+\[?\]:?([0-9]+)') {
+            $CONFIG_PORTS += [int]$matches[1]
+          }
+        }
+      }
+      $CONFIG_PORTS = @($CONFIG_PORTS | Select-Object -Unique | Sort-Object)
+
+      # ---- WORKER PROCESSES from config ----
+      $WORKER_PROCESSES = "unknown"
+      if ($CONFIG -ne "not-found" -and (Test-Path $CONFIG)) {
+        $confContent = Get-Content $CONFIG -ErrorAction SilentlyContinue
+        foreach ($line in $confContent) {
+          if ($line -match '^\s*worker_processes\s+(\d+)') {
+            $WORKER_PROCESSES = $matches[1]
+            break
+          } elseif ($line -match '^\s*worker_processes\s+auto;') {
+            $WORKER_PROCESSES = "auto"
+            break
+          }
+        }
+      }
+
+      # ---- ERROR LOG PATH ----
+      $ERROR_LOG = "not-found"
+      if ($CONFIG -ne "not-found" -and (Test-Path $CONFIG)) {
+        $confContent = Get-Content $CONFIG -ErrorAction SilentlyContinue
+        foreach ($line in $confContent) {
+          if ($line -match '^\s*error_log\s+"?([^"\s;]+)"?') {
+            $ERROR_LOG = $matches[1]
+            break
+          }
+        }
+      }
+
+      # ---- SERVICE NAME ----
+      $SERVICE_NAME = "not-found"
+      $svcFilter = 'Name LIKE "%nginx%"'
+      $allSvcs = Get-CimInstance Win32_Service -Filter $svcFilter -ErrorAction SilentlyContinue
+      foreach ($s in $allSvcs) {
+        $sPath = $s.PathName -replace '"', '' -replace '\s.*$', ''
+        if ($sPath -eq $BINARY) {
+          $SERVICE_NAME = $s.Name
+          break
+        }
+      }
+
+      Write-Output "BINARY=$BINARY^^^PIDS=$PIDS_STRING^^^VERSION=$VERSION^^^CONFIG=$CONFIG^^^PREFIX=$PREFIX^^^PORTS=$PORTS_STRING^^^MASTER_PID=$MASTER_PID^^^BINDIR=$BIN_DIR^^^WORKER_PROCESSES=$WORKER_PROCESSES^^^SERVICE=$SERVICE_NAME^^^ERROR_LOG=$ERROR_LOG^^^CONFIG_PORTS=$($CONFIG_PORTS -join ',')"
+  changed_when: false
+
+# ========================================
+# STEP 3: Execute the script for each instance
+# ========================================
+- name: Debug - Show instance being processed
+  debug:
+    msg: "Processing Nginx instance: {{ item }}"
+  loop: "{{ nginx_unique_instances }}"
+  when: nginx_unique_instances | length > 0
+
+- name: Collect all data for each unique Nginx instance
+  win_shell: |
+    $parts = '{{ item }}' -split '\|'
+    $binaryPath = $parts[0]
+    $configPath = if ($parts.Length -gt 1) { $parts[1] } else { "" }
+    & 'C:\Windows\Temp\nginx_collect.ps1' -BinaryPath $binaryPath -ConfigPath $configPath
+  args:
+    executable: powershell.exe
+  register: nginx_data_collection
+  changed_when: false
+  failed_when: false
+  loop: "{{ nginx_unique_instances }}"
+  when: nginx_unique_instances | length > 0
+
+- name: Debug - Show data collection results
+  debug:
+    msg: "stdout: [{{ item.stdout | default('EMPTY') }}] | rc: {{ item.rc | default('?') }}"
+  loop: "{{ nginx_data_collection.results | default([]) }}"
+  when: nginx_unique_instances | length > 0
+
+# ========================================
+# STEP 4: Clean up temp script
+# ========================================
+- name: Remove temp collector script
+  win_file:
+    path: C:\Windows\Temp\nginx_collect.ps1
+    state: absent
+  changed_when: false
+  failed_when: false
+
+# ========================================
+# STEP 5: Parse into JSON
+# ========================================
+- name: Initialize Nginx discovery array
+  set_fact:
+    discovery_array: []
+
+- name: Parse each instance
+  set_fact:
+    discovery_array: "{{ discovery_array + [json_instance] }}"
+  vars:
+    data_line: "{{ item.stdout_lines | select('search', '^BINARY=') | list | first | default('') }}"
+
+    binary_path:      "{{ (data_line | regex_search('BINARY=([^^]+)', '\\1') or [''])[0] | trim }}"
+    pids_raw:         "{{ (data_line | regex_search('PIDS=([^^]+)', '\\1') or [''])[0] | trim }}"
+    version:          "{{ (data_line | regex_search('VERSION=([^^]+)', '\\1') or ['unknown'])[0] | trim }}"
+    config_path:      "{{ (data_line | regex_search('CONFIG=([^^]+)', '\\1') or ['not-found'])[0] | trim }}"
+    prefix:           "{{ (data_line | regex_search('PREFIX=([^^]+)', '\\1') or ['not-found'])[0] | trim }}"
+    ports_raw:        "{{ (data_line | regex_search('PORTS=([^^]+)', '\\1') or ['none'])[0] | trim }}"
+    master_pid_raw:   "{{ (data_line | regex_search('MASTER_PID=([^^]+)', '\\1') or ['none'])[0] | trim }}"
+    bin_dir:          "{{ (data_line | regex_search('BINDIR=([^^]+)', '\\1') or [''])[0] | trim }}"
+    worker_processes: "{{ (data_line | regex_search('WORKER_PROCESSES=([^^]+)', '\\1') or ['unknown'])[0] | trim }}"
+    service_name:     "{{ (data_line | regex_search('SERVICE=([^^]+)', '\\1') or ['not-found'])[0] | trim }}"
+    error_log:        "{{ (data_line | regex_search('ERROR_LOG=([^^]+)', '\\1') or ['not-found'])[0] | trim }}"
+    config_ports_raw: "{{ (data_line | regex_search('CONFIG_PORTS=([^^]+)', '\\1') or ['none'])[0] | trim }}"
+
+    pids_array:         "{{ pids_raw.split(',') | map('int', default=0) | list if pids_raw not in ['', 'none'] else [] }}"
+    ports_array:        "{{ ports_raw.split(',') | map('int', default=0) | list if ports_raw not in ['', 'none'] else [] }}"
+    config_ports_array: "{{ config_ports_raw.split(',') | map('int', default=0) | list if config_ports_raw not in ['', 'none'] else [] }}"
+
+    json_instance:
+      service_type: "MIDDLEWARE"
+      service_name: "nginx"
+      service_version: "{{ version }}"
+      port: "{{ ports_array[0] if ports_array | length > 0 else None }}"
+      pid:  "{{ master_pid_raw | int if master_pid_raw not in ['', 'none'] else 0 }}"
+      paths:
+        binary_path: "{{ binary_path }}"
+        config_path: "{{ config_path if config_path != 'not-found' else None }}"
+        data_path:   "{{ prefix if prefix != 'not-found' else None }}"
+        log_path:    "{{ error_log if error_log != 'not-found' else None }}"
+      additional_details:
+        all_ports:        "{{ ports_array }}"
+        all_pids:         "{{ pids_array }}"
+        configured_ports: "{{ config_ports_array }}"
+        master_pid:       "{{ master_pid_raw if master_pid_raw not in ['', 'none'] else None }}"
+        worker_processes: "{{ worker_processes if worker_processes != 'unknown' else None }}"
+        windows_service:  "{{ service_name if service_name != 'not-found' else None }}"
+      status: "{{ 'RUNNING' if pids_array | length > 0 else 'STOPPED' }}"
+  loop: "{{ nginx_data_collection.results | default([]) }}"
+  when:
+    - item.stdout is defined
+    - item.stdout | trim != ''
+    - item.stdout_lines | select('search', '^BINARY=') | list | length > 0
+
+#################################################################
+# Append Nginx services to global discovered_services
+#################################################################
+- name: Append Nginx services to discovered_services
+  set_fact:
+    discovered_services: "{{ discovered_services + (discovery_array | default([])) }}"
+
+- name: Display discovery summary
+  debug:
+    msg: "Nginx Discovery: {{ discovery_array | length }} instance(s) found on {{ inventory_hostname }}"

@@ -3,4 +3,15 @@
 - name: Run MSSQL Discovery
   include_role:
     name: windows/db/mssql
-  
+
+- name: Run MongoDB Discovery
+  include_role:
+    name: windows/db/mongodb
+
+- name: Run MySQL Discovery
+  include_role:
+    name: windows/db/mysql
+
+- name: Run PostgreSQL Discovery
+  include_role:
+    name: windows/db/postgres

@@ -6,13 +6,13 @@
 
 - name: Run MongoDB Discovery
   include_role:
-    name: linux/db/mongodb
+    name: "{{ playbook_dir }}/../roles/linux/db/mongodb"
   
 - name: Run postgres Discovery
   include_role:
-    name: linux/db/postgres
+    name: "{{ playbook_dir }}/../roles/linux/db/postgres"
 
 - name: Run MySQL Discovery
   include_role:
-    name: linux/db/mysql
+    name: "{{ playbook_dir }}/../roles/linux/db/mysql"
   

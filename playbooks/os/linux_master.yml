@@ -34,13 +34,9 @@
   set_fact:
     boot_time_epoch: "{{ (current_epoch | int) - (uptime_seconds | int) }}"
 
-- name: Convert boot time to Asia/Kolkata ISO 8601
+- name: Convert boot time to UTC ISO 8601 Z format
   set_fact:
-    boot_time_iso: >-
-      {{
-        '%Y-%m-%dT%H:%M:%S+05:30'
-        | strftime((boot_time_epoch | int) + 19800)
-      }}
+    boot_time_iso: "{{ '%Y-%m-%dT%H:%M:%SZ' | strftime(boot_time_epoch | int) }}"
 
 #####################################################################
 # Convert Uptime to Human Readable Format

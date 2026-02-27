@@ -1,0 +1,28 @@
+# roles/windows/db/postgres - defaults
+---
+# Default PostgreSQL paths for Windows
+postgres_default_paths:
+  - "C:\\Program Files\\PostgreSQL\\*"
+  - "C:\\PostgreSQL\\*"
+  - "C:\\Postgres\\*"
+  - "{{ ansible_env['PROGRAMFILES'] | default('C:\\Program Files') }}\\PostgreSQL"
+  - "{{ ansible_env['PROGRAMFILES(X86)'] | default('C:\\Program Files (x86)') }}\\PostgreSQL"
+
+# Default PostgreSQL configuration file locations
+postgres_default_configs:
+  - "C:\\Program Files\\PostgreSQL\\*\\data\\postgresql.conf"
+  - "C:\\PostgreSQL\\*\\data\\postgresql.conf"
+  - "C:\\Postgres\\data\\postgresql.conf"
+  - "{{ ansible_env['APPDATA'] | default('C:\\Users\\%USERNAME%\\AppData\\Roaming') }}\\postgresql.conf"
+
+# Default PostgreSQL data and log paths
+postgres_default_data_path: "C:\\Program Files\\PostgreSQL\\*\\data"
+postgres_default_log_path: "C:\\Program Files\\PostgreSQL\\*\\data\\log\\*.log"
+
+# Default PostgreSQL port
+postgres_default_port: 5432
+
+# PostgreSQL Windows service name patterns
+postgres_service_names:
+  - "postgresql*"
+  - "postgres-*"

@@ -92,11 +92,11 @@
 # # Execute Middleware Discovery
 # #####################################################################
 
-# - name: Execute Windows Middleware Discovery
-#   block:
-#     - include_tasks: ../windows/middleware_discovery.yml
-#   rescue:
-#     - set_fact:
-#         final_status: "FAILED"
-#         final_error_message: "Middleware discovery failed: {{ ansible_failed_result.msg | default('Unknown error') }}"
+- name: Execute Windows Middleware Discovery
+  block:
+    - include_tasks: ../windows/middleware_discovery.yml
+  rescue:
+    - set_fact:
+        final_status: "FAILED"
+        final_error_message: "Middleware discovery failed: {{ ansible_failed_result.msg | default('Unknown error') }}"
 

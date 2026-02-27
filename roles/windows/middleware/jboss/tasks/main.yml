@@ -1,0 +1,533 @@
+---
+#################################################################
+# JBoss Discovery Role Tasks (Windows)
+#################################################################
+
+# ========================================
+# STEP 0: Snapshot all JBoss-related processes
+# ========================================
+- name: Debug - Show all JBoss-related processes
+  win_shell: |
+    Write-Output "=== All JBoss-related processes ==="
+    Get-CimInstance Win32_Process -Filter "Name LIKE '%java%'" |
+    Where-Object { $_.CommandLine -like '*jboss-modules.jar*' -or
+                  $_.CommandLine -like '*org.jboss.Main*' -or
+                  $_.CommandLine -like '*org.jboss.as.standalone*' -or
+                  $_.CommandLine -like '*org.jboss.as.host*' } |
+    Select-Object ProcessId, Name, CommandLine, ExecutablePath |
+    Format-List
+  register: jboss_debug
+  changed_when: false
+  failed_when: false
+
+- name: Show debug output
+  debug:
+    msg: "{{ jboss_debug.stdout }}"
+  when: jboss_debug.stdout is defined
+
+# ========================================
+# STEP 1: Extract unique JBoss instances from running processes
+# ========================================
+- name: Extract unique JBoss instances from running processes
+  win_shell: |
+    $processes = Get-CimInstance Win32_Process -Filter "Name LIKE '%java%'" |
+      Where-Object { $_.CommandLine -like '*jboss-modules.jar*' -or
+                    $_.CommandLine -like '*org.jboss.Main*' -or
+                    $_.CommandLine -like '*org.jboss.as.standalone*' -or
+                    $_.CommandLine -like '*org.jboss.as.host*' }
+
+    $uniqueInstances = @()
+    foreach ($proc in $processes) {
+      $cmdLine = $proc.CommandLine
+
+      # Extract JBOSS_HOME
+      $jbossHome = ""
+      if ($cmdLine -match '-Djboss\.home\.dir=([^\s"]+)') {
+        $jbossHome = $matches[1]
+      } elseif ($cmdLine -match '-Djboss\.home\.dir="([^"]+)"') {
+        $jbossHome = $matches[1]
+      }
+
+      # Extract JBOSS_BASE
+      $jbossBase = ""
+      if ($cmdLine -match '-Djboss\.server\.base\.dir=([^\s"]+)') {
+        $jbossBase = $matches[1]
+      } elseif ($cmdLine -match '-Djboss\.server\.base\.dir="([^"]+)"') {
+        $jbossBase = $matches[1]
+      }
+
+      # Extract server name
+      $serverName = "default"
+      if ($cmdLine -match '-Djboss\.server\.name=([^\s"]+)') {
+        $serverName = $matches[1]
+      } elseif ($cmdLine -match '-Djboss\.server\.name="([^"]+)"') {
+        $serverName = $matches[1]
+      }
+
+      # Detect mode (standalone, domain, host-controller)
+      $mode = "standalone"
+      if ($cmdLine -like '*standalone*') {
+        $mode = "standalone"
+      } elseif ($cmdLine -like '*domain*') {
+        $mode = "domain"
+      } elseif ($cmdLine -like '*host-controller*') {
+        $mode = "host-controller"
+      }
+
+      # Extract host name
+      $hostName = "N/A"
+      if ($cmdLine -match '-Djboss\.host\.name=([^\s"]+)') {
+        $hostName = $matches[1]
+      } elseif ($cmdLine -match '-Djboss\.host\.name="([^"]+)"') {
+        $hostName = $matches[1]
+      }
+
+      # Default JBOSS_BASE if not set
+      if ([string]::IsNullOrEmpty($jbossBase)) {
+        if ($mode -eq "standalone") {
+          $jbossBase = "$jbossHome\standalone"
+        } elseif ($mode -eq "domain") {
+          $jbossBase = "$jbossHome\domain"
+        } else {
+          $jbossBase = "$jbossHome\standalone"
+        }
+      }
+
+      # Create unique identifier
+      $instanceId = "$jbossHome|$jbossBase|$serverName|$mode|$hostName"
+      if ($uniqueInstances -notcontains $instanceId -and -not [string]::IsNullOrEmpty($jbossHome)) {
+        $uniqueInstances += $instanceId
+      }
+    }
+
+    $uniqueInstances | ForEach-Object { Write-Output $_ }
+  register: unique_instances
+  changed_when: false
+  failed_when: false
+
+- name: Set unique instances fact
+  set_fact:
+    jboss_unique_instances: "{{ unique_instances.stdout_lines | default([]) | select('search', '.+') | list }}"
+
+- name: Debug - Show captured instances
+  debug:
+    msg: "JBoss instances found: {{ jboss_unique_instances }}"
+
+# ========================================
+# FALLBACK: Discover JBoss from Windows Service
+# ========================================
+- name: Find JBoss services and extract installation paths
+  win_shell: |
+    $svc = Get-CimInstance Win32_Service -Filter "Name LIKE '%JBoss%' OR Name LIKE '%WildFly%' OR DisplayName LIKE '%JBoss%' OR DisplayName LIKE '%WildFly%'" -ErrorAction SilentlyContinue
+    if (-not $svc) {
+      Write-Output ""
+      exit 0
+    }
+
+    $uniquePaths = @()
+    foreach ($s in $svc) {
+      $path = $s.PathName
+      # Strip surrounding quotes
+      $path = $path -replace '^"', '' -replace '".*$', ''
+
+      # Try to extract JBOSS_HOME from the service path
+      # Usually looks like: C:\JBoss\bin\standalone.bat
+      if ($path -match '^(.+\\bin\\[^\\]+\.(bat|exe))') {
+        $binPath = $matches[1]
+        $jbossHome = Split-Path -Parent (Split-Path -Parent $binPath)
+        $instanceId = "$jbossHome|$jbossHome\standalone|default|standalone|N/A"
+        if ($uniquePaths -notcontains $instanceId) {
+          $uniquePaths += $instanceId
+          Write-Output $instanceId
+        }
+      }
+    }
+  register: service_discovery
+  changed_when: false
+  failed_when: false
+  when: jboss_unique_instances | length == 0
+
+- name: Debug - Service discovery result
+  debug:
+    msg: "Service discovery: {{ service_discovery.stdout_lines | default([]) }}"
+  when: jboss_unique_instances | length == 0
+
+- name: Add service instances to list if no processes found
+  set_fact:
+    jboss_unique_instances: "{{ service_discovery.stdout_lines | select('search', '.+') | list }}"
+  when:
+    - jboss_unique_instances | length == 0
+    - service_discovery.stdout_lines is defined
+    - service_discovery.stdout_lines | select('search', '.+') | list | length > 0
+
+- name: Debug - Final instances list
+  debug:
+    msg: "Final JBoss instances: {{ jboss_unique_instances }}"
+
+# ========================================
+# STEP 2: Write PowerShell collector script to disk
+# ========================================
+- name: Write JBoss data collector script to disk
+  win_copy:
+    dest: C:\Windows\Temp\jboss_collect.ps1
+    content: |
+      param(
+        [string]$JBossHome,
+        [string]$JBossBase,
+        [string]$ServerName,
+        [string]$Mode,
+        [string]$HostName
+      )
+
+      $ErrorActionPreference = 'SilentlyContinue'
+
+      $JBOSS_HOME = $JBossHome.Trim()
+      $JBOSS_BASE = $JBossBase.Trim()
+      $SERVER_NAME = $ServerName.Trim()
+      $MODE = $Mode.Trim()
+      $HOST_NAME = $HostName.Trim()
+
+      if (-not $JBOSS_HOME -or $JBOSS_HOME -eq '') {
+        Write-Output "JBOSS_HOME=none^^^JBOSS_BASE=none^^^SERVER_NAME=default^^^MODE=standalone^^^HOST_NAME=N/A^^^PIDS=none^^^VERSION_FULL=unknown^^^VERSION_NUM=unknown^^^CONFIG=not-found^^^BINDIR=^^^PORTS=none^^^CONFIG_PORTS=none^^^JVMOPTS=^^^DEPLOY_DIR=not-found^^^SERVICE=not-found"
+        exit 0
+      }
+
+      # ---- PIDs ----
+      # Find all java processes that match this JBoss instance
+      $PIDs = @()
+      $allJavaProcesses = Get-CimInstance Win32_Process -Filter "Name LIKE '%java%'"
+
+      foreach ($proc in $allJavaProcesses) {
+        $cmdLine = $proc.CommandLine
+        if ($cmdLine -like '*jboss-modules.jar*' -or $cmdLine -like '*org.jboss.as.standalone*' -or $cmdLine -like '*org.jboss.as.host*') {
+          $procHome = ""
+          $procBase = ""
+          $procServer = "default"
+          $procMode = "standalone"
+
+          if ($cmdLine -match '-Djboss\.home\.dir=([^\s"]+)') {
+            $procHome = $matches[1]
+          } elseif ($cmdLine -match '-Djboss\.home\.dir="([^"]+)"') {
+            $procHome = $matches[1]
+          }
+
+          if ($cmdLine -match '-Djboss\.server\.base\.dir=([^\s"]+)') {
+            $procBase = $matches[1]
+          } elseif ($cmdLine -match '-Djboss\.server\.base\.dir="([^"]+)"') {
+            $procBase = $matches[1]
+          }
+
+          if ($cmdLine -match '-Djboss\.server\.name=([^\s"]+)') {
+            $procServer = $matches[1]
+          } elseif ($cmdLine -match '-Djboss\.server\.name="([^"]+)"') {
+            $procServer = $matches[1]
+          }
+
+          if ($cmdLine -like '*standalone*') {
+            $procMode = "standalone"
+          } elseif ($cmdLine -like '*domain*') {
+            $procMode = "domain"
+          } elseif ($cmdLine -like '*host-controller*') {
+            $procMode = "host-controller"
+          }
+
+          # Default JBOSS_BASE if not set
+          if ([string]::IsNullOrEmpty($procBase)) {
+            if ($procMode -eq "standalone") {
+              $procBase = "$procHome\standalone"
+            } else {
+              $procBase = "$procHome\domain"
+            }
+          }
+
+          # Check if this process belongs to our instance
+          if ($procHome -eq $JBOSS_HOME -and $procBase -eq $JBOSS_BASE -and $procServer -eq $SERVER_NAME -and $procMode -eq $MODE) {
+            $PIDs += $proc.ProcessId
+          }
+        }
+      }
+
+      $PIDS_STRING = if ($PIDs.Count -gt 0) { ($PIDs -join ',') } else { "none" }
+
+      # ---- VERSION from product.conf or version.txt ----
+      $VERSION_FULL = "unknown"
+      $VERSION_NUM = "unknown"
+
+      # Check product.conf (JBoss EAP / WildFly)
+      $productConf = Join-Path $JBOSS_HOME "bin\product.conf"
+      if (Test-Path $productConf) {
+        $confContent = Get-Content $productConf -ErrorAction SilentlyContinue
+        foreach ($line in $confContent) {
+          if ($line -match '^slot=([^"]+)') {
+            $slot = $matches[1].Trim()
+            $VERSION_FULL = $slot
+            # Extract x.y.z format
+            if ($slot -match '(\d+\.\d+\.\d+)') {
+              $VERSION_NUM = $matches[1]
+            } elseif ($slot -match '(\d+\.\d+)') {
+              $VERSION_NUM = "$($matches[1]).0"
+            } else {
+              $VERSION_NUM = $slot
+            }
+            break
+          }
+        }
+      }
+
+      # Fallback: check version.txt
+      if ($VERSION_NUM -eq "unknown") {
+        $versionTxt = Join-Path $JBOSS_HOME "version.txt"
+        if (Test-Path $versionTxt) {
+          $firstLine = Get-Content $versionTxt -First 1 -ErrorAction SilentlyContinue
+          if ($firstLine -match '(\d+\.\d+\.\d+)') {
+            $VERSION_NUM = $matches[1]
+            $VERSION_FULL = $firstLine.Trim()
+          } elseif ($firstLine -match '(\d+\.\d+)') {
+            $VERSION_NUM = "$($matches[1]).0"
+            $VERSION_FULL = $firstLine.Trim()
+          }
+        }
+      }
+
+      # ---- CONFIG PATH ----
+      $CONFIG_PATH = "not-found"
+      if ($MODE -eq "standalone") {
+        $standaloneXml = Join-Path $JBOSS_BASE "configuration\standalone.xml"
+        if (Test-Path $standaloneXml) {
+          $CONFIG_PATH = $standaloneXml
+        } else {
+          $standaloneFullXml = Join-Path $JBOSS_BASE "configuration\standalone-full.xml"
+          if (Test-Path $standaloneFullXml) {
+            $CONFIG_PATH = $standaloneFullXml
+          }
+        }
+      } elseif ($MODE -eq "domain" -or $MODE -eq "host-controller") {
+        $domainXml = Join-Path $JBOSS_BASE "configuration\domain.xml"
+        $hostXml = Join-Path $JBOSS_BASE "configuration\host.xml"
+        if (Test-Path $domainXml) {
+          $CONFIG_PATH = $domainXml
+          if (Test-Path $hostXml) {
+            $CONFIG_PATH = "$CONFIG_PATH,$hostXml"
+          }
+        }
+      }
+
+      # ---- BIN DIRECTORY ----
+      $BIN_DIR = Join-Path $JBOSS_HOME "bin"
+
+      # ---- RUNTIME PORTS from listening sockets ----
+      $PORTS = @()
+      foreach ($p in $PIDs) {
+        $conns = Get-NetTCPConnection -OwningProcess $p -State Listen -ErrorAction SilentlyContinue
+        foreach ($c in $conns) {
+          if ($c.LocalPort) {
+            $PORTS += $c.LocalPort
+          }
+        }
+      }
+
+      # Remove duplicates and sort
+      $PORTS = @($PORTS | Select-Object -Unique | Sort-Object)
+      $PORTS_STRING = if ($PORTS.Count -gt 0) { ($PORTS -join ',') } else { "none" }
+
+      # ---- CONFIG PORTS from XML files ----
+      $CONFIG_PORTS = @()
+      foreach ($cfg in $CONFIG_PATH -split ',') {
+        if (Test-Path $cfg) {
+          [xml]$xml = Get-Content $cfg -ErrorAction SilentlyContinue
+          # Find socket-binding-group and interface elements with port attributes
+          $socketBindings = $xml.SelectNodes("//socket-binding[@port] | //@port-offset")
+          foreach ($binding in $socketBindings) {
+            if ($binding -is [System.Xml.XmlElement]) {
+              if ($binding.port -match '^\d+$') {
+                $port = [int]$binding.port
+                if ($port -notin $CONFIG_PORTS) {
+                  $CONFIG_PORTS += $port
+                }
+              }
+            }
+          }
+        }
+      }
+
+      $CONFIG_PORTS = @($CONFIG_PORTS | Select-Object -Unique | Sort-Object)
+      $CONFIG_PORTS_STRING = if ($CONFIG_PORTS.Count -gt 0) { ($CONFIG_PORTS -join ',') } else { "none" }
+
+      # ---- DEPLOYMENT DIRECTORY ----
+      $DEPLOY_DIR = "not-found"
+      if ($MODE -eq "standalone") {
+        $deployDir = Join-Path $JBOSS_BASE "deployments"
+        if (Test-Path $deployDir) {
+          $DEPLOY_DIR = $deployDir
+        }
+      } else {
+        $serverDeployDir = Join-Path $JBOSS_BASE "servers\$SERVER_NAME\deployments"
+        if (Test-Path $serverDeployDir) {
+          $DEPLOY_DIR = $serverDeployDir
+        }
+      }
+
+      # ---- JVM OPTIONS ----
+      $JVM_OPTS = ""
+      if ($PIDs.Count -gt 0) {
+        $FIRST_PID = $PIDs[0]
+        $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $FIRST_PID"
+        if ($proc) {
+          $cmdLine = $proc.CommandLine
+          # Extract key JVM options: Xms, Xmx, and XX options
+          $opts = @()
+          if ($cmdLine -match "-Xm[sx][^\s`'']+") {
+            $opts += $matches[0]
+          }
+          if ($cmdLine -match "-XX:[^\s`'']+") {
+            $opts += $matches[0]
+          }
+          $JVM_OPTS = ($opts | Select-Object -First 5) -join '###'
+        }
+      }
+
+      # ---- SERVICE NAME ----
+      $SERVICE_NAME = "not-found"
+      $allSvcs = Get-CimInstance Win32_Service -Filter "Name LIKE '%JBoss%' OR Name LIKE '%WildFly%' OR DisplayName LIKE '%JBoss%' OR DisplayName LIKE '%WildFly%'" -ErrorAction SilentlyContinue
+      foreach ($s in $allSvcs) {
+        $sPath = $s.PathName -replace '"', '' -replace "\\s.*$", ''
+        if ($sPath -like "*$JBOSS_HOME*") {
+          $SERVICE_NAME = $s.Name
+          break
+        }
+      }
+
+      Write-Output "JBOSS_HOME=$JBOSS_HOME^^^JBOSS_BASE=$JBOSS_BASE^^^SERVER_NAME=$SERVER_NAME^^^MODE=$MODE^^^HOST_NAME=$HOST_NAME^^^PIDS=$PIDS_STRING^^^VERSION_FULL=$VERSION_FULL^^^VERSION_NUM=$VERSION_NUM^^^CONFIG=$CONFIG_PATH^^^BINDIR=$BIN_DIR^^^PORTS=$PORTS_STRING^^^CONFIG_PORTS=$CONFIG_PORTS_STRING^^^JVMOPTS=$JVM_OPTS^^^DEPLOY_DIR=$DEPLOY_DIR^^^SERVICE=$SERVICE_NAME"
+  changed_when: false
+
+# ========================================
+# STEP 3: Execute the script for each instance
+# ========================================
+- name: Debug - Show instance being processed
+  debug:
+    msg: "Processing JBoss instance: {{ item }}"
+  loop: "{{ jboss_unique_instances }}"
+  when: jboss_unique_instances | length > 0
+
+# - name: Collect all data for each unique JBoss instance
+#   win_shell: |
+#     $parts = '{{ item }}' -split '\|'
+#     $jbossHome = $parts[0]
+#     $jbossBase = if ($parts.Length -gt 1) { $parts[1] } else { "$($parts[0])\standalone" }
+#     $serverName = if ($parts.Length -gt 2) { $parts[2] } else { "default" }
+#     $mode = if ($parts.Length -gt 3) { $parts[3] } else { "standalone" }
+#     $hostName = if ($parts.Length -gt 4) { $parts[4] } else { "N/A" }
+#     & 'C:\Windows\Temp\jboss_collect.ps1' -JBossHome $jbossHome -JBossBase $jbossBase -ServerName $serverName -Mode $mode -HostName $hostName
+#   args:
+#     executable: powershell.exe
+#   register: jboss_data_collection
+#   changed_when: false
+#   failed_when: false
+#   loop: "{{ jboss_unique_instances }}"
+#   when: jboss_unique_instances | length > 0
+
+- name: Collect all data for each unique JBoss instance
+  win_shell: |
+    $parts = '{{ item }}' -split '\|'
+    $jbossHome = $parts[0]
+    $jbossBase = if ($parts.Length -gt 1) { $parts[1] } else { $parts[0] + '\standalone' }
+    $serverName = if ($parts.Length -gt 2) { $parts[2] } else { 'default' }
+    $mode       = if ($parts.Length -gt 3) { $parts[3] } else { 'standalone' }
+    $hostName   = if ($parts.Length -gt 4) { $parts[4] } else { 'N/A' }
+    & 'C:\Windows\Temp\jboss_collect.ps1' -JBossHome $jbossHome -JBossBase $jbossBase -ServerName $serverName -Mode $mode -HostName $hostName
+  args:
+    executable: powershell.exe
+  register: jboss_data_collection
+  changed_when: false
+  failed_when: false
+  loop: "{{ jboss_unique_instances }}"
+  when: jboss_unique_instances | length > 0
+
+- name: Debug - Show data collection results
+  debug:
+    msg: "stdout: [{{ item.stdout | default('EMPTY') }}] | rc: {{ item.rc | default('?') }}"
+  loop: "{{ jboss_data_collection.results | default([]) }}"
+  when: jboss_unique_instances | length > 0
+
+# ========================================
+# STEP 4: Clean up temp script
+# ========================================
+- name: Remove temp collector script
+  win_file:
+    path: C:\Windows\Temp\jboss_collect.ps1
+    state: absent
+  changed_when: false
+  failed_when: false
+
+# ========================================
+# STEP 5: Parse into JSON
+# ========================================
+- name: Initialize JBoss discovery array
+  set_fact:
+    discovery_array: []
+
+- name: Parse each instance
+  set_fact:
+    discovery_array: "{{ discovery_array + [json_instance] }}"
+  vars:
+    data_line: "{{ item.stdout_lines | select('search', '^JBOSS_HOME=') | list | first | default('') }}"
+
+    jboss_home:   "{{ (data_line | regex_search('JBOSS_HOME=([^^]+)', '\\1') or [''])[0] | trim }}"
+    jboss_base:   "{{ (data_line | regex_search('JBOSS_BASE=([^^]+)', '\\1') or [''])[0] | trim }}"
+    server_name:  "{{ (data_line | regex_search('SERVER_NAME=([^^]+)', '\\1') or ['default'])[0] | trim }}"
+    mode:         "{{ (data_line | regex_search('MODE=([^^]+)', '\\1') or ['standalone'])[0] | trim }}"
+    host_name:    "{{ (data_line | regex_search('HOST_NAME=([^^]+)', '\\1') or ['N/A'])[0] | trim }}"
+    pids_raw:     "{{ (data_line | regex_search('PIDS=([^^]+)', '\\1') or [''])[0] | trim }}"
+    version_num:  "{{ (data_line | regex_search('VERSION_NUM=([^^]+)', '\\1') or ['unknown'])[0] | trim }}"
+    config_path:  "{{ (data_line | regex_search('CONFIG=([^^]+)', '\\1') or ['not-found'])[0] | trim }}"
+    bin_dir:      "{{ (data_line | regex_search('BINDIR=([^^]+)', '\\1') or [''])[0] | trim }}"
+    ports_raw:    "{{ (data_line | regex_search('PORTS=([^^]+)', '\\1') or ['none'])[0] | trim }}"
+    config_ports_raw: "{{ (data_line | regex_search('CONFIG_PORTS=([^^]+)', '\\1') or ['none'])[0] | trim }}"
+    deploy_dir:   "{{ (data_line | regex_search('DEPLOY_DIR=([^^]+)', '\\1') or ['not-found'])[0] | trim }}"
+    jvm_opts:     "{{ (data_line | regex_search('JVMOPTS=([^^]+)', '\\1') or [''])[0] | trim }}"
+    service_name: "{{ (data_line | regex_search('SERVICE=([^^]+)', '\\1') or ['not-found'])[0] | trim }}"
+
+    pids_array:       "{{ pids_raw.split(',') | map('int', default=0) | list if pids_raw not in ['', 'none'] else [] }}"
+    ports_array:      "{{ ports_raw.split(',') | map('int', default=0) | list if ports_raw not in ['', 'none'] else [] }}"
+    config_ports_array: "{{ config_ports_raw.split(',') | map('int', default=0) | list if config_ports_raw not in ['', 'none'] else [] }}"
+    jvm_opts_array:   "{{ jvm_opts.split('###') if jvm_opts != '' else [] }}"
+    config_paths_array: "{{ config_path.split(',') if config_path != 'not-found' else [] }}"
+
+    json_instance:
+      service_type: "MIDDLEWARE"
+      service_name: "jboss"
+      service_version: "{{ version_num }}"
+      port: "{{ ports_array[0] if ports_array | length > 0 else None }}"
+      pid:  "{{ pids_array[0] if pids_array | length > 0 else 0 }}"
+      paths:
+        binary_path: "{{ bin_dir }}\\{{ 'standalone.bat' if mode == 'standalone' else 'domain.bat' }}"
+        config_path: "{{ config_paths_array[0] if config_paths_array | length > 0 else None }}"
+        data_path:   "{{ jboss_base }}"
+      additional_details:
+        mode:              "{{ mode }}"
+        server_name:       "{{ server_name }}"
+        host_name:         "{{ host_name if host_name != 'N/A' else None }}"
+        all_ports:         "{{ ports_array }}"
+        all_pids:          "{{ pids_array }}"
+        configured_ports:  "{{ config_ports_array }}"
+        deployment_path:   "{{ deploy_dir if deploy_dir != 'not-found' else None }}"
+        jboss_home:        "{{ jboss_home }}"
+        jvm_options:       "{{ jvm_opts_array if jvm_opts_array | length > 0 else None }}"
+        windows_service:   "{{ service_name if service_name != 'not-found' else None }}"
+      status: "{{ 'RUNNING' if pids_array | length > 0 else 'STOPPED' }}"
+  loop: "{{ jboss_data_collection.results | default([]) }}"
+  when:
+    - item.stdout is defined
+    - item.stdout | trim != ''
+    - item.stdout_lines | select('search', '^JBOSS_HOME=') | list | length > 0
+
+#################################################################
+# Append JBoss services to global discovered_services
+#################################################################
+- name: Append JBoss services to discovered_services
+  set_fact:
+    discovered_services: "{{ discovered_services + (discovery_array | default([])) }}"
+
+- name: Display discovery summary
+  debug:
+    msg: "JBoss Discovery: {{ discovery_array | length }} instance(s) found on {{ inventory_hostname }}"

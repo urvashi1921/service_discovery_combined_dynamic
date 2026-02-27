@@ -13,44 +13,61 @@
   changed_when: false
   failed_when: false
 
+
 # ========================================
 # SINGLE PS COMMAND - EXTRACT EVERYTHING
+# (Uses printf instead of heredoc to avoid YAML parsing issues)
 # ========================================
+
+
 - name: Extract all MySQL/MariaDB process details in one call
   shell: |
     ps aux | awk '$11 ~ /(mysqld|mariadbd)$/ && $11 !~ /grep/' | while read -r line; do
       pid=$(echo "$line" | awk '{print $2}')
       binary=$(echo "$line" | awk '{print $11}')
+
       # Strict validation: binary must end with mysqld or mariadbd
       if [[ ! "$binary" =~ (mysqld|mariadbd)$ ]]; then
         continue
       fi
+
       # Verify the process is still running
       if ! kill -0 "$pid" 2>/dev/null; then
         continue
       fi
-      # Verify binary exists and is executable
+
+      # Verify binary exists and is executable (or at least present)
       if [ ! -x "$binary" ] && [ ! -e "$binary" ]; then
         continue
       fi
+
       # Double check via /proc/pid/cmdline
       if [ -f "/proc/$pid/cmdline" ]; then
-        cmdline=$(cat "/proc/$pid/cmdline" | tr '\0' ' ')
+        cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline")
         if [[ ! "$cmdline" =~ (mysqld|mariadbd) ]]; then
           continue
         fi
       else
         continue
       fi
+
       full_args=$(echo "$line" | awk '{for(i=11;i<=NF;i++) printf "%s ", $i; print ""}')
       basedir=$(echo "$full_args" | sed -n 's/.*--basedir=\([^ ]*\).*/\1/p' | head -1)
       datadir=$(echo "$full_args" | sed -n 's/.*--datadir=\([^ ]*\).*/\1/p' | head -1)
       defaults_file=$(echo "$full_args" | sed -n 's/.*--defaults-file=\([^ ]*\).*/\1/p' | head -1)
       socket=$(echo "$full_args" | sed -n 's/.*--socket=\([^ ]*\).*/\1/p' | head -1)
       port=$(echo "$full_args" | sed -n 's/.*--port=\([^ ]*\).*/\1/p' | head -1)
+
+      # X Plugin args (both styles) and mysqlx enable flag
+      mysqlx_port=$(echo "$full_args" | sed -n 's/.*--mysqlx-port=\([^ ]*\).*/\1/p; s/.*--mysqlx_port=\([^ ]*\).*/\1/p' | head -1)
+      mysqlx_flag=$(echo "$full_args" | sed -n 's/.*--mysqlx=\([^ ]*\).*/\1/p' | head -1)
+
+      # Canonicalize binary path
       if [ -n "$binary" ] && [ -e "$binary" ]; then
         binary=$(readlink -f "$binary" 2>/dev/null || echo "$binary")
       fi
+
+      # Derive instance key preference
       if [ -n "$datadir" ] && [ -d "$datadir" ]; then
         instance_key="$datadir"
       elif [ -n "$basedir" ] && [ -d "$basedir" ]; then
@@ -60,9 +77,9 @@
       else
         instance_key="$binary"
       fi
-      cat <<EOF
-    {"pid":"${pid}","binary":"${binary:-not-found}","basedir":"${basedir:-}","datadir":"${datadir:-}","defaults_file":"${defaults_file:-}","socket":"${socket:-}","port":"${port:-}","instance_key":"${instance_key}"}
-    EOF
+
+      printf '{"pid":"%s","binary":"%s","basedir":"%s","datadir":"%s","defaults_file":"%s","socket":"%s","port":"%s","mysqlx_port":"%s","mysqlx_flag":"%s","instance_key":"%s"}\n' \
+        "$pid" "${binary:-not-found}" "${basedir:-}" "${datadir:-}" "${defaults_file:-}" "${socket:-}" "${port:-}" "${mysqlx_port:-}" "${mysqlx_flag:-}" "$instance_key"
     done
   args:
     executable: /bin/bash
@@ -70,11 +87,13 @@
   changed_when: false
   failed_when: false
 
-- name: Parse Output 
-  debug:
-    msg:
-      - "Output Parse: {{ mysql_processes_raw }}"
-      
+ 
+ 
+ 
+
+- debug:
+    var: mysql_processes_raw.stdout_lines
+
 # ========================================
 # PARSE RAW OUTPUT INTO STRUCTURED DATA
 # ========================================
@@ -118,81 +137,180 @@
       DATADIR="$6"
       DEFAULTS_FILE="$7"
       SOCKET_INPUT="$8"
-      # Strict validation: binary must end with mysqld or mariadbd
+      PORT_INPUT="$9"
+      MYSQLX_PORT_INPUT="${10}"
+      MYSQLX_FLAG_INPUT="${11}"
+
+      # Ensure mysqld/mariadbd
       if [[ ! "$BINARY" =~ (mysqld|mariadbd)$ ]]; then
         exit 0
       fi
-      # Verify binary exists and is executable
-      if [ ! -x "$BINARY" ] && [ ! -e "$BINARY" ]; then
-        exit 0
-      fi
-      # Verify PIDs are still running and are actually MySQL/MariaDB
+      [ ! -e "$BINARY" ] && exit 0
+
+      # Filter valid PIDs
       PIDS=""
       for pid in $(echo "$PIDS_INPUT" | tr ',' ' '); do
-        if kill -0 "$pid" 2>/dev/null; then
-          # Double check via /proc/pid/cmdline
-          if [ -f "/proc/$pid/cmdline" ]; then
-            cmdline=$(cat "/proc/$pid/cmdline" | tr '\0' ' ')
-            if [[ "$cmdline" =~ (mysqld|mariadbd) ]]; then
-              PIDS="$PIDS,$pid"
-            fi
-          fi
+        if kill -0 "$pid" 2>/dev/null && [ -f "/proc/$pid/cmdline" ]; then
+          cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline")
+          [[ "$cmdline" =~ (mysqld|mariadbd) ]] && PIDS="$PIDS,$pid"
         fi
       done
-      PIDS=$(echo "$PIDS" | sed 's/^,//')
-      if [ -z "$PIDS" ]; then
-        exit 0
-      fi
+      PIDS="${PIDS#,}"
+      [ -z "$PIDS" ] && exit 0
+
+      # Version
       VERSION="unknown"
-      if [ -n "$BINARY" ] && [ -x "$BINARY" ] && [ "$BINARY" != "not-found" ]; then
-        VERSION=$($BINARY --version 2>/dev/null | head -n1 | sed -n 's/.*Ver \([0-9]\+\.[0-9]\+\.[0-9]\+\).*/\1/p' | head -1)
-      fi
-      if [ -z "$VERSION" ] || [ "$VERSION" = "unknown" ]; then
-        if command -v mysql >/dev/null 2>&1; then
-          VERSION=$(mysql --version 2>/dev/null | sed -n 's/.*Distrib \([0-9]\+\.[0-9]\+\.[0-9]\+\).*/\1/p' | head -1)
-        fi
+      if [ -x "$BINARY" ]; then
+        VERSION=$("$BINARY" --version 2>/dev/null | head -n1 \
+          | sed -n 's/.*Ver \([0-9]\+\.[0-9]\+\.[0-9]\+\).*/\1/p' | head -1)
       fi
       [ -z "$VERSION" ] && VERSION="unknown"
-      PORTS=""
-      case "$NETWORK_TOOL" in
-        ss)
-          for pid in $(echo $PIDS | tr ',' ' '); do
-            PORTS="$PORTS $(ss -ltnp 2>/dev/null | grep "pid=$pid" | awk '{print $4}' | awk -F: '{print $NF}')"
-          done
-          ;;
-        netstat)
-          for pid in $(echo $PIDS | tr ',' ' '); do
-            PORTS="$PORTS $(netstat -tulnp 2>/dev/null | grep "$pid/" | awk '{print $4}' | awk -F: '{print $NF}')"
-          done
-          ;;
-        lsof)
-          for pid in $(echo $PIDS | tr ',' ' '); do
-            PORTS="$PORTS $(lsof -p $pid -i -P -n 2>/dev/null | awk '{print $9}' | awk -F: '{print $2}')"
-          done
-          ;;
-      esac
-      PORTS=$(echo $PORTS | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u | paste -sd, -)
-      [ -z "$PORTS" ] && PORTS="none"
-      CONFIG_FILE="$DEFAULTS_FILE"
-      if [ -z "$CONFIG_FILE" ] || [ "$CONFIG_FILE" = "not-found" ]; then
-        for conf in "/etc/mysql/my.cnf" "/etc/my.cnf" "$BASEDIR/my.cnf" "$DATADIR/my.cnf" "/usr/etc/my.cnf" "~/.my.cnf"; do
-          if [ -f "$conf" ] && [ -r "$conf" ]; then
-            CONFIG_FILE="$conf"
-            break
-          fi
+
+      # Config resolution (zero-scan near binary/datadir)
+      CONFIG_FILE=""
+      if [ -n "$DEFAULTS_FILE" ] && [ -f "$DEFAULTS_FILE" ]; then
+        CONFIG_FILE=$(readlink -f "$DEFAULTS_FILE" 2>/dev/null || echo "$DEFAULTS_FILE")
+      fi
+      if [ -z "$CONFIG_FILE" ] && [ -n "$BINARY" ]; then
+        BIN_DIR=$(dirname "$BINARY")
+        for conf in "$BIN_DIR/my.cnf" "$BIN_DIR/../my.cnf" "$BIN_DIR/../etc/my.cnf"; do
+          if [ -f "$conf" ]; then CONFIG_FILE=$(readlink -f "$conf" 2>/dev/null || echo "$conf"); break; fi
+        done
+      fi
+      if [ -z "$CONFIG_FILE" ] && [ -n "$DATADIR" ]; then
+        DATA_PARENT=$(dirname "$DATADIR")
+        for conf in "$DATA_PARENT/my.cnf" "$DATA_PARENT/etc/my.cnf"; do
+          if [ -f "$conf" ]; then CONFIG_FILE=$(readlink -f "$conf" 2>/dev/null || echo "$conf"); break; fi
         done
       fi
       [ -z "$CONFIG_FILE" ] && CONFIG_FILE="not-found"
+
+      # Socket (no forced default)
       SOCKET="$SOCKET_INPUT"
       if [ -z "$SOCKET" ]; then
-        for sock in /var/lib/mysql/mysql.sock /tmp/mysql.sock /var/run/mysqld/mysqld.sock "$DATADIR/mysql.sock"; do
-          if [ -S "$sock" ]; then
-            SOCKET="$sock"
-            break
-          fi
+        for sock in "$DATADIR/mysql.sock" "$DATADIR/mysqld.sock" /var/run/mysqld/mysqld.sock /tmp/mysql.sock; do
+          if [ -S "$sock" ]; then SOCKET="$sock"; break; fi
         done
       fi
-      [ -z "$SOCKET" ] && SOCKET="/var/lib/mysql/mysql.sock"
+      [ -z "$SOCKET" ] && SOCKET="not-found"
+
+      # Network candidates (actual listeners of the mysqld PIDs)
+      PORTS_RAW=""
+      case "$NETWORK_TOOL" in
+        ss)
+          for pid in $(echo "$PIDS" | tr ',' ' '); do
+            PORTS_RAW="$PORTS_RAW $(ss -ltnp 2>/dev/null | grep -w "pid=$pid" | awk '{print $4}' | awk -F: '{print $NF}')"
+          done
+          ;;
+        netstat)
+          for pid in $(echo "$PIDS" | tr ',' ' '); do
+            PORTS_RAW="$PORTS_RAW $(netstat -tulnp 2>/dev/null | awk -v p="$pid/" '$0 ~ p {print $4}' | awk -F: '{print $NF}')"
+          done
+          ;;
+        lsof)
+          for pid in $(echo "$PIDS" | tr ',' ' '); do
+            PORTS_RAW="$PORTS_RAW $(lsof -p "$pid" -i -P -n 2>/dev/null | awk 'NR>1 {print $9}' | awk -F: '{print $2}')"
+          done
+          ;;
+      esac
+      PORTS_LIST=$(echo "$PORTS_RAW" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u)
+
+      # Extract classic port + mysqlx_port + mysqlx flag from config (if available)
+      CFG_PORT=""
+      CFG_MYSQLX_PORT=""
+      CFG_MYSQLX_FLAG=""
+      if [ -f "$CONFIG_FILE" ]; then
+        CFG_PORT=$(awk '
+          BEGIN{IGNORECASE=1; sec=""}
+          /^\s*\[.*\]\s*$/ { s=$0; gsub(/[\[\]]/,"",s); sec=s }
+          /^[[:space:]]*port[[:space:]]*=/ {
+            if (sec=="mysqld" || sec=="server") {
+              gsub(/[[:space:]]/, "", $0);
+              split($0,a,"=");
+              if (a[2] ~ /^[0-9]+$/) { print a[2]; exit }
+            }
+          }' "$CONFIG_FILE" | head -n1)
+
+        CFG_MYSQLX_PORT=$(awk '
+          BEGIN{IGNORECASE=1}
+          /^[[:space:]]*mysqlx[_-]?port[[:space:]]*=/ {
+            gsub(/[[:space:]]/, "", $0);
+            split($0,a,"=");
+            if (a[2] ~ /^[0-9]+$/) { print a[2]; exit }
+          }' "$CONFIG_FILE" | head -n1)
+
+        CFG_MYSQLX_FLAG=$(awk '
+          BEGIN{IGNORECASE=1}
+          /^[[:space:]]*mysqlx[[:space:]]*=/ {
+            gsub(/[[:space:]]/, "", $0);
+            split($0,a,"=");
+            print a[2]; exit
+          }' "$CONFIG_FILE" | head -n1)
+      fi
+
+      # Normalize flags like ON/OFF/1/0 → ON/OFF
+      norm_flag() {
+        v=$(echo "$1" | tr '[:lower:]' '[:upper:]')
+        case "$v" in
+          1|ON|TRUE|YES) echo "ON" ;;
+          0|OFF|FALSE|NO) echo "OFF" ;;
+          *) echo "" ;;
+        esac
+      }
+      MYSQLX_FLAG_NORM="$(norm_flag "$MYSQLX_FLAG_INPUT")"
+      CFG_MYSQLX_FLAG_NORM="$(norm_flag "$CFG_MYSQLX_FLAG")"
+
+      # Build exclusion set for X Plugin port(s)
+      EXCLUDE_PORTS=""
+      if echo "$MYSQLX_PORT_INPUT" | grep -qE '^[0-9]+$'; then
+        EXCLUDE_PORTS="$EXCLUDE_PORTS $MYSQLX_PORT_INPUT"
+      fi
+      if echo "$CFG_MYSQLX_PORT" | grep -qE '^[0-9]+$'; then
+        EXCLUDE_PORTS="$EXCLUDE_PORTS $CFG_MYSQLX_PORT"
+      fi
+      # If mysqlx is enabled but no port specified anywhere, exclude default 33060
+      if [ -z "$MYSQLX_PORT_INPUT$CFG_MYSQLX_PORT" ]; then
+        if [ "$MYSQLX_FLAG_NORM" = "ON" ] || [ "$CFG_MYSQLX_FLAG_NORM" = "ON" ]; then
+          EXCLUDE_PORTS="$EXCLUDE_PORTS 33060"
+        fi
+      fi
+
+      # Count how many listener ports were seen
+      PORTS_COUNT=$(echo "$PORTS_LIST" | sed '/^$/d' | wc -l | awk '{print $1}')
+
+      # Final port selection (no hardcoded classic default)
+      # Priority:
+      #   1) CFG_PORT from config
+      #   2) PORT_INPUT from process args
+      #   3) From actual listeners (exclude X Plugin); if multiple remain and one is 33060, drop 33060; then pick smallest
+      FINAL_PORT=""
+      if echo "$CFG_PORT" | grep -qE '^[0-9]+$'; then
+        FINAL_PORT="$CFG_PORT"
+      elif echo "$PORT_INPUT" | grep -qE '^[0-9]+$'; then
+        FINAL_PORT="$PORT_INPUT"
+      else
+        FILTERED=""
+        for p in $PORTS_LIST; do
+          skip=""
+          # drop explicitly excluded X Plugin ports
+          for x in $EXCLUDE_PORTS; do
+            [ "$p" = "$x" ] && skip="yes" && break
+          done
+          # pragmatic rule: if multiple listeners and one is 33060, drop 33060
+          if [ "$PORTS_COUNT" -gt 1 ] && [ "$p" = "33060" ]; then
+            skip="yes"
+          fi
+          [ -z "$skip" ] && FILTERED="$FILTERED $p"
+        done
+        FINAL_PORT=$(echo "$FILTERED" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -n | head -n1)
+      fi
+
+      if [ -z "$FINAL_PORT" ]; then
+        PORTS="none"
+      else
+        PORTS="$FINAL_PORT"
+      fi
+
       echo "VERSION=$VERSION|||PORTS=$PORTS|||SOCKET=$SOCKET|||CONFIG=$CONFIG_FILE|||PIDS=$PIDS"
   when: mysql_unique_instances | length > 0
 
@@ -206,10 +324,13 @@
       "{{ network_tool.stdout }}" \
       "{{ (mysql_processes | selectattr('instance_key', 'equalto', item) | map(attribute='binary') | first) | default('not-found') }}" \
       "{{ (mysql_processes | selectattr('instance_key', 'equalto', item) | map(attribute='pid') | join(',')) }}" \
-      "{{ (mysql_processes | selectattr('instance_key', 'equalto', item) | map(attribute='basedir') | select() | first) | default('/usr') }}" \
-      "{{ (mysql_processes | selectattr('instance_key', 'equalto', item) | map(attribute='datadir') | select() | first) | default(item) }}" \
+      "{{ (mysql_processes | selectattr('instance_key', 'equalto', item) | map(attribute='basedir') | select() | first) | default('') }}" \
+      "{{ (mysql_processes | selectattr('instance_key', 'equalto', item) | map(attribute='datadir') | select() | first) | default('') }}" \
       "{{ (mysql_processes | selectattr('instance_key', 'equalto', item) | map(attribute='defaults_file') | select() | first) | default('') }}" \
-      "{{ (mysql_processes | selectattr('instance_key', 'equalto', item) | map(attribute='socket') | select() | first) | default('') }}"
+      "{{ (mysql_processes | selectattr('instance_key', 'equalto', item) | map(attribute='socket') | select() | first) | default('') }}" \
+      "{{ (mysql_processes | selectattr('instance_key', 'equalto', item) | map(attribute='port') | select() | first) | default('') }}" \
+      "{{ (mysql_processes | selectattr('instance_key', 'equalto', item) | map(attribute='mysqlx_port') | select() | first) | default('') }}" \
+      "{{ (mysql_processes | selectattr('instance_key', 'equalto', item) | map(attribute='mysqlx_flag') | select() | first) | default('') }}"
   register: mysql_additional_data
   changed_when: false
   failed_when: false
@@ -224,6 +345,7 @@
     path: /tmp/mysql_collect_data.sh
     state: absent
   when: mysql_unique_instances | length > 0
+
 
 # ========================================
 # BUILD FINAL JSON STRUCTURE

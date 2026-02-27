@@ -1,0 +1,14 @@
+# roles/windows/db/mongodb - vars
+---
+# MongoDB service detection patterns
+mongodb_process_names:
+  - "mongod.exe"
+
+# MongoDB executable search patterns
+mongodb_binary_patterns:
+  - "C:\\Program Files\\MongoDB\\Server\\*\\bin\\mongod.exe"
+  - "C:\\MongoDB\\bin\\mongod.exe"
+
+# MongoDB Windows service name patterns
+mongodb_service_patterns:
+  - "MongoDB*"

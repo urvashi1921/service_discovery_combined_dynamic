@@ -1,0 +1,34 @@
+# roles/windows/db/postgres - vars
+---
+# PostgreSQL process detection patterns
+postgres_process_names:
+  - "postgres.exe"
+  - "pg_ctl.exe"
+  - "pg_wrapper.exe"
+
+# PostgreSQL executable search patterns
+postgres_binary_patterns:
+  - "C:\\Program Files\\PostgreSQL\\*\\bin\\postgres.exe"
+  - "C:\\PostgreSQL\\*\\bin\\postgres.exe"
+  - "C:\\Postgres\\bin\\postgres.exe"
+
+# PostgreSQL command line arguments to search for
+postgres_cmdline_args:
+  - "-D"
+  - "--config-file"
+  - "-c"
+  - "-k"
+  - "--port"
+
+# PostgreSQL version regex patterns
+postgres_version_patterns:
+  - "PostgreSQL\\s+([\\d.]+)"
+  - "postgres\\s+\\(PostgreSQL\\)\\s+([\\d.]+)"
+  - "([\\d]+\\.[\\d]+\\.[\\d]+)"
+
+# PostgreSQL config file parameters
+postgres_config_params:
+  - "port"
+  - "max_connections"
+  - "shared_buffers"
+  - "listen_addresses"

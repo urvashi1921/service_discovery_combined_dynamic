@@ -1,0 +1,386 @@
+---
+#################################################################
+# MongoDB Discovery Role Tasks (Windows)
+#################################################################
+# ========================================
+# STEP 0: Snapshot all MongoDB processes
+# ========================================
+- name: Debug - Show all MongoDB-related processes
+  win_shell: |
+    Write-Output "=== All MongoDB-related processes ==="
+    Get-CimInstance Win32_Process -Filter "Name LIKE '%mongo%'" |
+    Select-Object ProcessId, Name, CommandLine, ExecutablePath |
+    Format-List
+  register: mongodb_debug
+  changed_when: false
+  failed_when: false
+
+- name: Show debug output
+  debug:
+    msg: "{{ mongodb_debug.stdout }}"
+
+# ========================================
+# STEP 1: Extract unique binary paths from running processes
+# ========================================
+- name: Extract unique MongoDB binaries from running processes
+  win_shell: |
+    Get-CimInstance Win32_Process -Filter "Name='mongod.exe'" |
+    Select-Object -ExpandProperty ExecutablePath |
+    Where-Object { $_ -ne $null -and $_ -ne '' } |
+    Sort-Object -Unique
+  register: unique_binaries
+  changed_when: false
+  failed_when: false
+
+- name: Set unique binaries fact
+  set_fact:
+    mongodb_unique_binaries: "{{ unique_binaries.stdout_lines | default([]) | select('search', '.exe') | list }}"
+
+- name: Debug - Show captured binaries
+  debug:
+    msg: "MongoDB binaries found: {{ mongodb_unique_binaries }}"
+
+# ========================================
+# FALLBACK: Discover binary path from Windows Service
+# ========================================
+- name: Find MongoDB services and extract binary path
+  win_shell: |
+    $svc = Get-CimInstance Win32_Service -Filter "Name LIKE 'MongoDB%' OR Name LIKE 'mongod%' OR DisplayName LIKE '%MongoDB%'"
+    if (-not $svc) {
+      Write-Output ""
+      exit 0
+    }
+    foreach ($s in $svc) {
+      $path = $s.PathName
+      # Strip surrounding quotes
+      $path = $path -replace '^"', '' -replace '".*$', ''
+      # Extract just the .exe path (remove any trailing args)
+      if ($path -match '^(.+\.exe)') {
+        Write-Output $matches[1].Trim()
+      }
+    }
+  register: service_binary_discovery
+  changed_when: false
+  failed_when: false
+  when: mongodb_unique_binaries | length == 0
+
+- name: Debug - Service binary discovery result
+  debug:
+    msg: "Service binary discovery: {{ service_binary_discovery.stdout_lines | default([]) }}"
+  when: mongodb_unique_binaries | length == 0
+
+- name: Add service binaries to list if no processes found
+  set_fact:
+    mongodb_unique_binaries: "{{ service_binary_discovery.stdout_lines | select('search', '.exe') | list }}"
+  when:
+    - mongodb_unique_binaries | length == 0
+    - service_binary_discovery.stdout_lines is defined
+    - service_binary_discovery.stdout_lines | select('search', '.exe') | list | length > 0
+
+- name: Debug - Final binaries list
+  debug:
+    msg: "Final MongoDB binaries: {{ mongodb_unique_binaries }}"
+
+# ========================================
+# STEP 2: Write PowerShell collector script to disk
+# Using win_copy avoids ALL Jinja2/YAML quote-stripping issues.
+# ========================================
+- name: Write MongoDB data collector script to disk
+  win_copy:
+    dest: C:\Windows\Temp\mongodb_collect.ps1
+    content: |
+      param([string]$BinaryPath)
+      $ErrorActionPreference = 'SilentlyContinue'
+
+      $BINARY = $BinaryPath.Trim()
+      if (-not $BINARY -or $BINARY -eq '') {
+        Write-Output "BINARY=NONE^^^PIDS=none^^^VERSION=unknown^^^CONFIG=not-found^^^DBPATH=C:\data\db^^^PORTS=27017^^^LOGPATH=not-found^^^BINDIR=^^^SERVICE=not-found"
+        exit 0
+      }
+
+      # ---- PIDs ----
+      # Escape backslashes and single-quotes for WMI CQL filter
+      $escapedForWMI = $BINARY -replace "\\", "\\\\" -replace "'", "\\'"
+      $processes = Get-CimInstance Win32_Process -Filter "ExecutablePath = '$escapedForWMI'"
+      $PIDs = @($processes | ForEach-Object { $_.ProcessId })
+      $PIDS_STRING = if ($PIDs.Count -gt 0) { ($PIDs -join ',') } else { "none" }
+
+      # ---- VERSION from file metadata ----
+      $VERSION = "unknown"
+      if (Test-Path $BINARY) {
+        try {
+          $fi = Get-Item $BINARY -ErrorAction Stop
+          $v  = $fi.VersionInfo.FileVersion
+          if (-not $v -or $v -eq '') { $v = $fi.VersionInfo.ProductVersion }
+          if ($v -and $v -ne '') { $VERSION = $v.Trim() }
+        } catch {}
+      }
+      # Fallback: parse version from --version output
+      if ($VERSION -eq "unknown" -and (Test-Path $BINARY)) {
+        try {
+          $vOut = & "$BINARY" --version 2>&1 | Out-String
+          if ($vOut -match 'db version v(\d+\.\d+\.\d+)') {
+            $VERSION = $matches[1]
+          } elseif ($vOut -match '(\d+\.\d+\.\d+)') {
+            $VERSION = $matches[1]
+          }
+        } catch {}
+      }
+
+      # ---- CONFIG / DBPATH / LOGPATH from process command line ----
+      $CONFIG_PATH = "not-found"
+      $DBPATH      = "not-found"
+      $LOGPATH     = "not-found"
+
+      if ($PIDs.Count -gt 0) {
+        $cmdLine = $processes[0].CommandLine
+        if ($cmdLine) {
+          # --config or -f flag
+          if    ($cmdLine -match '(?:--config|-f)[= ]+"([^"]+)"')  { $c = $matches[1]; if (Test-Path $c) { $CONFIG_PATH = $c } }
+          elseif($cmdLine -match "(?:--config|-f)[= ]+'([^']+)'")  { $c = $matches[1]; if (Test-Path $c) { $CONFIG_PATH = $c } }
+          elseif($cmdLine -match '(?:--config|-f)[= ]+(\S+)')      { $c = $matches[1]; if (Test-Path $c) { $CONFIG_PATH = $c } }
+
+          # --dbpath
+          if    ($cmdLine -match '--dbpath[= ]+"([^"]+)"')         { $c = $matches[1]; if (Test-Path $c) { $DBPATH = $c } }
+          elseif($cmdLine -match "--dbpath[= ]+'([^']+)'")         { $c = $matches[1]; if (Test-Path $c) { $DBPATH = $c } }
+          elseif($cmdLine -match '--dbpath[= ]+(\S+)')             { $c = $matches[1]; if (Test-Path $c) { $DBPATH = $c } }
+
+          # --logpath
+          if    ($cmdLine -match '--logpath[= ]+"([^"]+)"')        { $LOGPATH = $matches[1] }
+          elseif($cmdLine -match "--logpath[= ]+'([^']+)'")        { $LOGPATH = $matches[1] }
+          elseif($cmdLine -match '--logpath[= ]+(\S+)')            { $LOGPATH = $matches[1] }
+
+          # --port (explicit override)
+          $CMD_PORT = $null
+          if ($cmdLine -match '--port[= ]+(\d+)') { $CMD_PORT = [int]$matches[1] }
+        }
+      }
+
+      # ---- CONFIG fallback: check well-known paths ----
+      if ($CONFIG_PATH -eq "not-found") {
+        $BIN_DIR_TMP = Split-Path -Parent $BINARY
+        $INSTALL_DIR = Split-Path -Parent $BIN_DIR_TMP
+        $candidates = @(
+          (Join-Path $BIN_DIR_TMP "mongod.cfg"),
+          (Join-Path $INSTALL_DIR "mongod.cfg"),
+          (Join-Path $INSTALL_DIR "bin\mongod.cfg"),
+          'C:\Program Files\MongoDB\Server\8.0\bin\mongod.cfg',
+          'C:\Program Files\MongoDB\Server\7.0\bin\mongod.cfg',
+          'C:\Program Files\MongoDB\Server\6.0\bin\mongod.cfg',
+          'C:\Program Files\MongoDB\Server\5.0\bin\mongod.cfg',
+          'C:\Program Files\MongoDB\Server\4.4\bin\mongod.cfg',
+          'C:\MongoDB\mongod.cfg',
+          "$env:ALLUSERSPROFILE\MongoDB\mongod.cfg"
+        )
+        foreach ($cfg in $candidates) {
+          if (Test-Path $cfg) { $CONFIG_PATH = $cfg; break }
+        }
+      }
+
+      # ---- DBPATH fallback: parse from config file ----
+      if ($DBPATH -eq "not-found" -and $CONFIG_PATH -ne "not-found") {
+        $cfgContent = Get-Content $CONFIG_PATH -ErrorAction SilentlyContinue
+        $inStorage = $false
+        foreach ($line in $cfgContent) {
+          # YAML-style config: storage.dbPath
+          if ($line -match '^\s*storage\s*:')   { $inStorage = $true }
+          if ($inStorage -and $line -match '^\s*dbPath\s*:\s*(.+)') {
+            $d = $matches[1].Trim().Trim('"').Trim("'")
+            if (Test-Path $d) { $DBPATH = $d; break }
+          }
+          # Legacy key=value style
+          if ($line -match '^\s*dbpath\s*=\s*(.+)') {
+            $d = $matches[1].Trim().Trim('"').Trim("'")
+            if (Test-Path $d) { $DBPATH = $d; break }
+          }
+        }
+      }
+      if ($DBPATH -eq "not-found") { $DBPATH = "C:\data\db" }
+
+      # ---- LOGPATH fallback: parse from config file ----
+      if ($LOGPATH -eq "not-found" -and $CONFIG_PATH -ne "not-found") {
+        $cfgContent = Get-Content $CONFIG_PATH -ErrorAction SilentlyContinue
+        $inSystemLog = $false
+        foreach ($line in $cfgContent) {
+          # YAML-style config: systemLog.path
+          if ($line -match '^\s*systemLog\s*:') { $inSystemLog = $true }
+          if ($inSystemLog -and $line -match '^\s*path\s*:\s*(.+)') {
+            $LOGPATH = $matches[1].Trim().Trim('"').Trim("'"); break
+          }
+          # Legacy key=value style
+          if ($line -match '^\s*logpath\s*=\s*(.+)') {
+            $LOGPATH = $matches[1].Trim().Trim('"').Trim("'"); break
+          }
+        }
+      }
+
+      # ---- PORT: first from config, then netstat, then default ----
+      $RESOLVED_PORT = $null
+      if ($CONFIG_PATH -ne "not-found" -and -not $RESOLVED_PORT) {
+        $cfgContent = Get-Content $CONFIG_PATH -ErrorAction SilentlyContinue
+        $inNet = $false
+        foreach ($line in $cfgContent) {
+          if ($line -match '^\s*net\s*:') { $inNet = $true }
+          if ($inNet -and $line -match '^\s*port\s*:\s*(\d+)') {
+            $RESOLVED_PORT = [int]$matches[1]; break
+          }
+          if ($line -match '^\s*port\s*=\s*(\d+)') {
+            $RESOLVED_PORT = [int]$matches[1]; break
+          }
+        }
+      }
+
+      # ---- PORTS from listening sockets ----
+      $PORTS = @()
+      if ($CMD_PORT) { $PORTS += $CMD_PORT }
+      foreach ($p in $PIDs) {
+        $conns = Get-NetTCPConnection -OwningProcess $p -State Listen -ErrorAction SilentlyContinue
+        foreach ($c in $conns) { if ($c.LocalPort) { $PORTS += $c.LocalPort } }
+      }
+      if ($PORTS.Count -eq 0 -and $PIDs.Count -gt 0) {
+        $nsLines = netstat -ano 2>$null
+        foreach ($line in $nsLines) {
+          foreach ($p in $PIDs) {
+            if ($line -match "TCP\s+[^\s]+:(\d+)\s+[^\s]+\s+LISTENING\s+${p}\s*$") {
+              $PORTS += [int]$matches[1]
+            }
+          }
+        }
+      }
+      if ($PORTS.Count -eq 0 -and $RESOLVED_PORT) { $PORTS += $RESOLVED_PORT }
+      $PORTS = @($PORTS | Select-Object -Unique | Sort-Object)
+      $PORTS_STRING = if ($PORTS.Count -gt 0) { ($PORTS -join ',') } else { "27017" }
+
+      $BIN_DIR = Split-Path -Parent $BINARY
+
+      # ---- SERVICE NAME ----
+      $SERVICE_NAME = "not-found"
+      $allSvcs = Get-CimInstance Win32_Service -Filter "Name LIKE 'MongoDB%' OR Name LIKE 'mongod%'" -ErrorAction SilentlyContinue
+      foreach ($s in $allSvcs) {
+        $sPath = $s.PathName -replace '"', ''
+        if ($sPath -like "*mongod*") {
+          $SERVICE_NAME = $s.Name
+          break
+        }
+      }
+
+      # ---- REPLICA SET / AUTH from config ----
+      $REPLICA_SET = "not-found"
+      $AUTH_ENABLED = "unknown"
+      if ($CONFIG_PATH -ne "not-found") {
+        $cfgContent = Get-Content $CONFIG_PATH -ErrorAction SilentlyContinue
+        $inReplication = $false
+        $inSecurity    = $false
+        foreach ($line in $cfgContent) {
+          if ($line -match '^\s*replication\s*:') { $inReplication = $true }
+          if ($inReplication -and $line -match '^\s*replSetName\s*:\s*(.+)') {
+            $REPLICA_SET = $matches[1].Trim().Trim('"').Trim("'")
+          }
+          if ($line -match '^\s*replSet\s*=\s*(.+)') {
+            $REPLICA_SET = $matches[1].Trim()
+          }
+          if ($line -match '^\s*security\s*:') { $inSecurity = $true }
+          if ($inSecurity -and $line -match '^\s*authorization\s*:\s*(.+)') {
+            $AUTH_ENABLED = $matches[1].Trim().Trim('"').Trim("'")
+          }
+          if ($line -match '^\s*auth\s*=\s*(.+)') {
+            $AUTH_ENABLED = $matches[1].Trim()
+          }
+        }
+      }
+
+      Write-Output "BINARY=$BINARY^^^PIDS=$PIDS_STRING^^^VERSION=$VERSION^^^CONFIG=$CONFIG_PATH^^^DBPATH=$DBPATH^^^PORTS=$PORTS_STRING^^^LOGPATH=$LOGPATH^^^BINDIR=$BIN_DIR^^^SERVICE=$SERVICE_NAME^^^REPLICASET=$REPLICA_SET^^^AUTH=$AUTH_ENABLED"
+  changed_when: false
+
+# ========================================
+# STEP 3: Execute the script for each binary
+# ========================================
+- name: Debug - Show binary being processed
+  debug:
+    msg: "Processing MongoDB binary: {{ item }}"
+  loop: "{{ mongodb_unique_binaries }}"
+  when: mongodb_unique_binaries | length > 0
+
+- name: Collect all data for each unique binary
+  win_shell: "& 'C:\\Windows\\Temp\\mongodb_collect.ps1' -BinaryPath '{{ item }}'"
+  args:
+    executable: powershell.exe
+  register: mongodb_data_collection
+  changed_when: false
+  failed_when: false
+  loop: "{{ mongodb_unique_binaries }}"
+  when: mongodb_unique_binaries | length > 0
+
+- name: Debug - Show data collection results
+  debug:
+    msg: "stdout: [{{ item.stdout | default('EMPTY') }}] | rc: {{ item.rc | default('?') }} | stderr: {{ item.stderr | default('NONE') }}"
+  loop: "{{ mongodb_data_collection.results | default([]) }}"
+  when: mongodb_unique_binaries | length > 0
+
+# ========================================
+# STEP 4: Clean up temp script
+# ========================================
+- name: Remove temp collector script
+  win_file:
+    path: C:\Windows\Temp\mongodb_collect.ps1
+    state: absent
+  changed_when: false
+  failed_when: false
+
+# ========================================
+# STEP 5: Parse into JSON
+# ========================================
+- name: Initialize discovery array
+  set_fact:
+    discovery_array: []
+
+- name: Parse each instance
+  set_fact:
+    discovery_array: "{{ discovery_array + [json_instance] }}"
+  vars:
+    data_line: "{{ item.stdout_lines | select('search', '^BINARY=') | list | first | default('') }}"
+
+    binary_path:  "{{ (data_line | regex_search('BINARY=([^^]+)', '\\1') or [''])[0] | trim }}"
+    pids_raw:     "{{ (data_line | regex_search('PIDS=([^^]+)', '\\1') or [''])[0] | trim }}"
+    version:      "{{ (data_line | regex_search('VERSION=([^^]+)', '\\1') or ['unknown'])[0] | trim }}"
+    config_path:  "{{ (data_line | regex_search('CONFIG=([^^]+)', '\\1') or ['not-found'])[0] | trim }}"
+    dbpath:       "{{ (data_line | regex_search('DBPATH=([^^]+)', '\\1') or ['C:\\data\\db'])[0] | trim }}"
+    ports_raw:    "{{ (data_line | regex_search('PORTS=([^^]+)', '\\1') or ['27017'])[0] | trim }}"
+    logpath:      "{{ (data_line | regex_search('LOGPATH=([^^]+)', '\\1') or ['not-found'])[0] | trim }}"
+    service_name: "{{ (data_line | regex_search('SERVICE=([^^]+)', '\\1') or ['not-found'])[0] | trim }}"
+    replica_set:  "{{ (data_line | regex_search('REPLICASET=([^^]+)', '\\1') or ['not-found'])[0] | trim }}"
+    auth_enabled: "{{ (data_line | regex_search('AUTH=([^^]+)', '\\1') or ['unknown'])[0] | trim }}"
+
+    pids_array:  "{{ pids_raw.split(',') | map('int') | list if pids_raw not in ['', 'none'] else [] }}"
+    ports_array: "{{ ports_raw.split(',') | map('int') | list if ports_raw not in ['', 'none'] else [27017] }}"
+
+    json_instance:
+      service_type: "DATABASE"
+      service_name: "mongodb"
+      service_version: "{{ version }}"
+      port: "{{ ports_array[0] if ports_array | length > 0 else 27017 }}"
+      pid:  "{{ pids_array[0] if pids_array | length > 0 else 0 }}"
+      paths:
+        binary_path: "{{ binary_path }}"
+        config_path: "{{ config_path if config_path != 'not-found' else None }}"
+        data_path:   "{{ dbpath }}"
+        log_path:    "{{ logpath if logpath != 'not-found' else None }}"
+      additional_details:
+        all_ports:    "{{ ports_array }}"
+        all_pids:     "{{ pids_array }}"
+        service_name: "{{ service_name if service_name != 'not-found' else None }}"
+        replica_set:  "{{ replica_set if replica_set != 'not-found' else None }}"
+        auth_enabled: "{{ auth_enabled if auth_enabled != 'unknown' else None }}"
+      status: "{{ 'RUNNING' if pids_array | length > 0 else 'STOPPED' }}"
+  loop: "{{ mongodb_data_collection.results | default([]) }}"
+  when:
+    - item.stdout is defined
+    - item.stdout | trim != ''
+    - item.stdout_lines | select('search', '^BINARY=') | list | length > 0
+
+#################################################################
+# Append MongoDB services to global discovered_services
+#################################################################
+- name: Append MongoDB services to discovered_services
+  set_fact:
+    discovered_services: "{{ discovered_services + (discovery_array | default([])) }}"

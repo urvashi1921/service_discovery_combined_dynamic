@@ -1,1 +1,24 @@
 # roles/windows/db/mysql - vars
+---
+# MySQL process detection patterns
+mysql_process_names:
+  - "mysqld.exe"
+  - "mysqld-nt.exe"
+
+# MySQL executable search patterns
+mysql_binary_patterns:
+  - "C:\\Program Files\\MySQL\\MySQL Server *\\bin\\mysqld.exe"
+  - "C:\\Program Files (x86)\\MySQL\\MySQL Server *\\bin\\mysqld.exe"
+  - "C:\\MySQL\\bin\\mysqld.exe"
+
+# MySQL command line arguments to search for
+mysql_cmdline_args:
+  - "--defaults-file"
+  - "--datadir"
+  - "--log-error"
+  - "--port"
+
+# MySQL version regex patterns
+mysql_version_patterns:
+  - "Ver\\s+([\\d.]+)"
+  - "([\\d]+\\.[\\d]+\\.[\\d]+)"

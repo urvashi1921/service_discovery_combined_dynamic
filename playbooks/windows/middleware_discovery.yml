@@ -1,1 +1,27 @@
 # playbooks/windows/middleware_discovery.yml
+---
+#################################################################
+# Windows Middleware Discovery Playbook
+#################################################################
+# This playbook discovers all middleware services running on Windows
+#################################################################
+
+- name: Run Tomcat Discovery
+  include_role:
+    name: windows/middleware/tomcat
+
+- name: Run Apache HTTP Server Discovery
+  include_role:
+    name: windows/middleware/apache
+
+- name: Run Nginx Discovery
+  include_role:
+    name: windows/middleware/nginx
+
+- name: Run JBoss Discovery
+  include_role:
+    name: windows/middleware/jboss
+
+# - name: Run IIS Discovery
+#   include_role:
+#     name: windows/middleware/iis

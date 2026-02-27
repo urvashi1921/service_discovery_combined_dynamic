@@ -1,0 +1,20 @@
+# roles/windows/db/mongodb - defaults
+---
+# Default MongoDB paths for Windows
+mongodb_default_paths:
+  - "C:\\Program Files\\MongoDB\\Server"
+  - "C:\\MongoDB"
+  - "{{ ansible_env['ALLUSERSPROFILE'] | default('C:\\ProgramData') }}\\MongoDB"
+
+# Default MongoDB configuration file locations
+mongodb_default_configs:
+  - "C:\\Program Files\\MongoDB\\Server\\*\\bin\\mongod.cfg"
+  - "C:\\MongoDB\\mongod.cfg"
+  - "{{ ansible_env['ALLUSERSPROFILE'] | default('C:\\ProgramData') }}\\MongoDB\\mongod.cfg"
+
+# Default MongoDB data and log paths
+mongodb_default_data_path: "C:\\data\\db"
+mongodb_default_log_path: "C:\\data\\log\\mongod.log"
+
+# Default MongoDB port
+mongodb_default_port: 27017
